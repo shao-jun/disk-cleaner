@@ -98,7 +98,7 @@ class Cleaner(Gtk.Window):
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         hb.set_title('磁盘垃圾清理')
-        hb.set_subtitle('勾选左侧项目加入清理 · 点击某行查看具体文件')
+        hb.set_subtitle('左侧勾选整类,右侧可逐条挑文件 · 只清理勾中的那些')
         self.set_titlebar(hb)
 
         self.spinner = Gtk.Spinner()
