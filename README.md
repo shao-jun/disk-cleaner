@@ -10,12 +10,25 @@
 
 - **三级风险分级**:安全 / 谨慎 / 高风险,默认只勾安全项,谨慎项自己挑,20G 的聊天图片不会被误删
 - **先看再删**:每个类别都能展开看到具体文件(大小、修改时间、完整路径),双击在文件管理器中打开并选中
+- **明细实时过滤**:右侧输入框按路径 / 大小 / 日期即时筛选,`Ctrl+F` 聚焦、`Esc` 清空;过滤只影响列表显示,不改动任何勾选
 - **时间阈值**:30 / 60 / 90 / 180 天 / 不限,最近动过的东西不会被扫进来
 - **企业微信专项**:未完成的下载残留(`*.P2P.DOWNLOAD`)、日志压缩包(`log.tar.gz`、`var.zip`)、解压出来的 `var/log` 目录、deb 包、视频、网页内核缓存、聊天图片
 - **系统类目自动提权**:journald、apt 缓存、coredump、`/var/tmp`、轮转日志标记「需密码」,勾选后在终端里输一次密码即可
 - **图形界面 + 命令行**:同一个扫描核心,两个前端
 
 ## 安装
+
+**方式一:deb 安装包(推荐)**
+
+双击 `disk-cleaner_<版本>_all.deb` 即可,或者:
+
+```bash
+sudo dpkg -i disk-cleaner_1.1.0_all.deb
+```
+
+装到 `/usr/bin` 和 `/usr/share`,启动器里出现「磁盘垃圾清理」。卸载:`sudo apt remove disk-cleaner`。
+
+**方式二:源码装到家目录(不需要 root)**
 
 ```bash
 git clone git@github.com:shao-jun/disk-cleaner.git
@@ -31,6 +44,20 @@ cd disk-cleaner
 卸载:`./uninstall.sh`
 
 依赖:Python 3(GTK 界面需要 `python3-gi`,UOS/deepin 自带)。
+
+## 打包与分发
+
+```bash
+./build.sh            # 输出到 dist/
+./build.sh 1.2.0      # 指定版本号
+```
+
+| 产物 | 适合谁 | 怎么用 |
+|---|---|---|
+| `dist/disk-cleaner_<版本>_all.deb` | UOS / deepin 桌面用户 | 双击安装,或 `sudo dpkg -i` |
+| `dist/disk-cleaner-<版本>.tar.gz` | 要拷源码、离线环境 | 解压后 `./install.sh` |
+
+deb 是纯 Python,`Architecture: all`,amd64 / arm64 / loongarch 通吃,依赖只有 `python3`、`python3-gi`、`gir1.2-gtk-3.0`(UOS 自带)。
 
 ## 命令行用法
 

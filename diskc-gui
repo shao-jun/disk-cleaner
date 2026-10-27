@@ -51,6 +51,7 @@ class Cleaner(Gtk.Window):
         self.set_default_size(1080, 720)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect('destroy', Gtk.main_quit)
+        self.connect('key-press-event', self._on_win_key)
 
         self.days = 30
         self.results = {}
@@ -59,6 +60,11 @@ class Cleaner(Gtk.Window):
         self.cleaning = False
         self.first_scan = True
         self.pending_select = None
+        self.detail_query = ''
+        self.detail_title = ''
+        self.detail_total = 0
+        self.detail_size = 0
+        self.detail_err = ''
 
         self._build_css()
         self._build_ui()
@@ -193,20 +199,44 @@ class Cleaner(Gtk.Window):
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         paned.add2(right)
 
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        head.set_margin_start(10)
+        head.set_margin_end(10)
+        head.set_margin_top(8)
+        head.set_margin_bottom(6)
+        right.pack_start(head, False, False, 0)
+
         self.detail_head = Gtk.Label()
         self.detail_head.set_xalign(0)
         self.detail_head.set_ellipsize(Pango.EllipsizeMode.END)
         self.detail_head.set_markup('<span size="small" color="#888888">'
                                     '点击左侧类别查看文件 · 双击某一项可在文件管理器中定位</span>')
-        self.detail_head.set_margin_start(10)
-        self.detail_head.set_margin_end(8)
-        self.detail_head.set_margin_top(9)
-        self.detail_head.set_margin_bottom(5)
-        right.pack_start(self.detail_head, False, False, 0)
+        head.pack_start(self.detail_head, True, True, 0)
+
+        self.detail_search = Gtk.SearchEntry()
+        self.detail_search.set_placeholder_text('过滤路径 / 大小 / 日期')
+        self.detail_search.set_size_request(190, -1)
+        # 用 changed 而不是 search-changed:后者有 150ms 延迟且异步,不是真实时
+        self.detail_search.connect('changed', self._on_detail_filter)
+        self.detail_search.connect('key-press-event', self._on_search_key)
+        head.pack_end(self.detail_search, False, False, 0)
+
+        # 匹配计数单独放,避免被类别名的省略号吃掉
+        self.match_label = Gtk.Label()
+        self.match_label.set_xalign(1.0)
+        self.match_label.set_markup('<span size="small" color="#888888"></span>')
+        head.pack_end(self.match_label, False, False, 0)
 
         # 第一列必须是 64 位:单个项目可超过 2G(< 2^31),用 int 会溢出导致明细整片空白
         self.detail_store = Gtk.ListStore(GObject.TYPE_INT64, str, str, str)
-        dtv = Gtk.TreeView(model=self.detail_store)
+        # 过滤层:只影响显示,不改动数据,也不改动左侧勾选
+        self.detail_filter = self.detail_store.filter_new()
+        self.detail_filter.set_visible_func(self._detail_visible)
+        # TreeModelFilter 在 PyGObject 里没有 set_sort_column_id,套一层 TreeModelSort
+        # 才能按大小排序(含点表头),排序在过滤之后进行
+        self.detail_model = Gtk.TreeModelSort(model=self.detail_filter)
+        self.detail_model.set_sort_column_id(0, Gtk.SortType.DESCENDING)
+        dtv = Gtk.TreeView(model=self.detail_model)
         dtv.set_enable_search(False)
 
         r = Gtk.CellRendererText()
@@ -416,31 +446,94 @@ class Cleaner(Gtk.Window):
                 if p.startswith('journalctl --'):
                     ts = '—'
                 self.detail_store.append([s, hsize(s), ts, p])
-            extra = ''
-            if r.get('err'):
-                extra = ' · <span foreground="#b26a00">%s</span>' % r['err']
-            if not items:
-                extra = ' · <span color="#888888">没有匹配项</span>'
-            self.detail_head.set_markup(
-                '<b>%s</b> · %d 项 · %s%s'
-                % (GLib.markup_escape_text(title), len(items),
-                   hsize(sum(s for _, s in items)), extra))
-            self.detail_store.set_sort_column_id(0, Gtk.SortType.DESCENDING)
+            self.detail_title = title
+            self.detail_total = len(items)
+            self.detail_size = sum(s for _, s in items)
+            self.detail_err = r.get('err') or ''
+            self._refresh_detail_head()
         except Exception as e:
             self.detail_head.set_markup(
                 '<b>%s</b> · <span foreground="#c62828">读取明细失败:%s</span>'
                 % (GLib.markup_escape_text(title), GLib.markup_escape_text(str(e))))
 
+    # ---- 明细过滤:只影响列表显示,不改动左侧勾选,也不改数据
+
+    def _detail_matches(self, model, it):
+        q = self.detail_query
+        if not q:
+            return True
+        path = model.get_value(it, 3) or ''
+        size = model.get_value(it, 1) or ''
+        ts = model.get_value(it, 2) or ''
+        return (q in path.lower() or q in size.lower() or q in ts)
+
+    def _detail_visible(self, model, it, data=None):
+        return self._detail_matches(model, it)
+
+    def _visible_count(self):
+        n = 0
+        it = self.detail_store.get_iter_first()
+        while it is not None:
+            if self._detail_matches(self.detail_store, it):
+                n += 1
+            it = self.detail_store.iter_next(it)
+        return n
+
+    def _refresh_detail_head(self):
+        if not self.detail_title:
+            return
+        parts = ['<b>%s</b>' % GLib.markup_escape_text(self.detail_title),
+                 hsize(self.detail_size)]
+        if self.detail_total == 0:
+            parts.append('<span color="#888888">没有匹配项</span>')
+        elif self.detail_err:
+            parts.append('<span foreground="#b26a00">%s</span>'
+                         % GLib.markup_escape_text(self.detail_err))
+        self.detail_head.set_markup(' · '.join(parts))
+
+        if self.detail_query:
+            n = self._visible_count()
+            txt = '%d / %d 项匹配' % (n, self.detail_total)
+            color = '#c62828' if n == 0 else '#888888'
+        else:
+            txt = '%d 项' % self.detail_total
+            color = '#888888'
+        self.match_label.set_markup('<span size="small" color="%s">%s</span>'
+                                    % (color, GLib.markup_escape_text(txt)))
+
+    def _on_detail_filter(self, entry):
+        q = entry.get_text().strip().lower()
+        if q == self.detail_query:
+            return
+        self.detail_query = q
+        self.detail_filter.refilter()
+        self._refresh_detail_head()
+
+    def _on_search_key(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            widget.set_text('')
+            return True
+        return False
+
+    def _on_win_key(self, widget, event):
+        """Ctrl+F 聚焦明细过滤框。"""
+        if (event.state & Gdk.ModifierType.CONTROL_MASK and
+                event.keyval in (Gdk.KEY_f, Gdk.KEY_F)):
+            self.detail_search.grab_focus()
+            return True
+        return False
+
     def _on_detail_tooltip(self, widget, x, y, keyboard, tooltip):
         pos = widget.get_path_at_pos(x, y)
         if not pos:
             return False
-        it = self.detail_store.get_iter(pos[0])
+        # TreeView 挂在过滤层上,path 属于 filter,取值也要走 filter
+        it = self.detail_model.get_iter(pos[0])
         if it is None:
             return False
-        size = self.detail_store.get_value(it, 0)
-        ts = self.detail_store.get_value(it, 2)
-        path = self.detail_store.get_value(it, 3)
+        size = self.detail_model.get_value(it, 0)
+        ts = self.detail_model.get_value(it, 2)
+        path = self.detail_model.get_value(it, 3)
         hint = ''
         if not path.startswith('journalctl --'):
             hint = '\n<span size="small" color="#888888">双击可在文件管理器中定位</span>'
@@ -452,10 +545,10 @@ class Cleaner(Gtk.Window):
     # ---- 明细操作:双击定位 / 右键菜单
 
     def _on_detail_activate(self, tv, path, col):
-        it = self.detail_store.get_iter(path)
+        it = self.detail_model.get_iter(path)
         if it is None:
             return
-        self.reveal(self.detail_store.get_value(it, 3))
+        self.reveal(self.detail_model.get_value(it, 3))
 
     def _on_detail_click(self, widget, event):
         if event.button != 3:
@@ -463,10 +556,10 @@ class Cleaner(Gtk.Window):
         pos = widget.get_path_at_pos(int(event.x), int(event.y))
         if not pos:
             return False
-        it = self.detail_store.get_iter(pos[0])
+        it = self.detail_model.get_iter(pos[0])
         if it is None:
             return False
-        target = self.detail_store.get_value(it, 3)
+        target = self.detail_model.get_value(it, 3)
         widget.get_selection().select_iter(it)
         menu = Gtk.Menu()
         if not target.startswith('journalctl --'):
@@ -668,6 +761,14 @@ def main():
             n = int(sys.argv[i + 1])
             GLib.timeout_add(1500, lambda: (app.select_row(n), False)[1])
         except (IndexError, ValueError):
+            pass
+
+    if '--filter' in sys.argv:
+        i = sys.argv.index('--filter')
+        try:
+            txt = sys.argv[i + 1]
+            GLib.timeout_add(2500, lambda: (app.detail_search.set_text(txt), False)[1])
+        except IndexError:
             pass
 
     Gtk.main()
