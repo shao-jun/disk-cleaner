@@ -18,8 +18,8 @@
 ## 安装
 
 ```bash
-git clone git@github.com:shao-jun/diskc.git
-cd diskc
+git clone git@github.com:shao-jun/disk-cleaner.git
+cd disk-cleaner
 ./install.sh
 ```
 
