@@ -29,6 +29,11 @@ PKEXEC_PY = ('/usr/bin/python3' if os.path.exists('/usr/bin/python3')
 from importlib.machinery import SourceFileLoader  # noqa: E402
 CORE = SourceFileLoader('diskc_core', DISKC).load_module()
 
+APP_VERSION = '1.2.1'
+APP_AUTHOR = 'shao-jun'
+APP_EMAIL = 'shao-jun@users.noreply.github.com'
+APP_URL = 'https://github.com/shao-jun/disk-cleaner'
+
 RISK_COLOR = {'safe': '#2e7d32', 'careful': '#b26a00', 'risky': '#c62828'}
 RISK_LABEL = {'safe': '安全', 'careful': '谨慎', 'risky': '高风险'}
 
@@ -124,6 +129,11 @@ class Cleaner(Gtk.Window):
         btn_rescan = Gtk.Button(label='重新扫描')
         btn_rescan.connect('clicked', lambda *a: self.rescan())
         hb.pack_end(btn_rescan)
+
+        btn_about = Gtk.Button(label='关于')
+        btn_about.set_tooltip_text('作者与项目主页')
+        btn_about.connect('clicked', self._on_about)
+        hb.pack_end(btn_about)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(box)
@@ -982,6 +992,21 @@ class Cleaner(Gtk.Window):
         except OSError:
             self._info('未找到终端程序。请在终端手动执行:\n\n'
                        'sudo python3 %s --files-from %s' % (DISKC, path))
+
+    def _on_about(self, *a):
+        dlg = Gtk.AboutDialog(transient_for=self, modal=True)
+        dlg.set_program_name('磁盘垃圾清理')
+        dlg.set_version(APP_VERSION)
+        dlg.set_comments('给 UOS / deepin 桌面用的磁盘垃圾清理工具。\n'
+                         '按风险分级,先看再删,清理粒度到单个文件。')
+        dlg.set_authors(['%s <%s>' % (APP_AUTHOR, APP_EMAIL)])
+        dlg.set_copyright('© 2026 %s' % APP_AUTHOR)
+        dlg.set_website(APP_URL)
+        dlg.set_website_label('github.com/shao-jun/disk-cleaner')
+        dlg.set_license_type(Gtk.License.MIT_X11)
+        dlg.set_logo_icon_name('diskc')
+        dlg.run()
+        dlg.destroy()
 
     def _info(self, text, mtype=Gtk.MessageType.INFO):
         dlg = Gtk.MessageDialog(transient_for=self, flags=0,

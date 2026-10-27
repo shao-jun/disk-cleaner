@@ -4,7 +4,7 @@
 set -e
 
 cd "$(dirname "$0")"
-VERSION="${1:-${VERSION:-1.2.0}}"
+VERSION="${1:-${VERSION:-1.2.1}}"
 PKG=disk-cleaner
 BUILD=build
 DIST=dist
@@ -24,6 +24,8 @@ done
 # 程序
 install -m 755 diskc "$ROOT/usr/bin/diskc"
 install -m 755 diskc-gui "$ROOT/usr/bin/diskc-gui"
+# 让「关于」里显示打包版本,而不是源码里的默认值
+sed -i "s|^APP_VERSION = .*|APP_VERSION = '$VERSION'|" "$ROOT/usr/bin/diskc-gui"
 
 # 图标
 install -m 644 assets/diskc.svg "$ROOT/usr/share/icons/hicolor/scalable/apps/diskc.svg"
@@ -77,7 +79,7 @@ mkdir -p "$ROOT/usr/share/doc/$PKG"
     echo
     echo "  * 首次发布:图形界面 + 命令行,18 个清理类别,风险分级。"
     echo
-    echo " -- 王少君 <wangshaojun@uniontech.com>  $(date -R)"
+    echo " -- shao-jun <shao-jun@users.noreply.github.com>  $(date -R)"
 } | gzip -9n > "$ROOT/usr/share/doc/$PKG/changelog.Debian.gz"
 
 # control
@@ -91,7 +93,7 @@ Architecture: all
 Installed-Size: $SIZE
 Depends: python3 (>= 3.5), python3-gi, gir1.2-gtk-3.0
 Recommends: dde-file-manager
-Maintainer: 王少君 <wangshaojun@uniontech.com>
+Maintainer: shao-jun <shao-jun@users.noreply.github.com>
 Description: 磁盘垃圾清理工具(图形界面 + 命令行)
  扫描并清理系统日志、apt 缓存、崩溃转储、企业微信下载的日志包与
  解压目录、deb 安装包、视频和各类开发缓存。按风险分为安全、谨慎、
