@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#5b9bf8"/>
+      <stop offset="0.55" stop-color="#2c6ad4"/>
+      <stop offset="1" stop-color="#123a86"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d3e2f6"/>
+    </linearGradient>
+    <linearGradient id="platter" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8f1fd"/>
+      <stop offset="1" stop-color="#b9d0ec"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe789"/>
+      <stop offset="1" stop-color="#ffb01f"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 底板 -->
+  <rect x="3" y="3" width="122" height="122" rx="27" fill="url(#bg)"/>
+  <rect x="3" y="3" width="122" height="122" rx="27" fill="none"
+        stroke="#ffffff" stroke-opacity="0.18" stroke-width="1.5"/>
+
+  <!-- 硬盘外壳(3.5 寸盘俯视) -->
+  <rect x="21" y="40" width="86" height="68" rx="10" fill="url(#body)"/>
+  <rect x="21" y="40" width="86" height="16" rx="10" fill="#c2d7f0"/>
+  <rect x="21" y="50" width="86" height="6" fill="#c2d7f0"/>
+  <!-- 螺丝 -->
+  <circle cx="30" cy="48" r="2.6" fill="#8fb0d6"/>
+  <circle cx="98" cy="48" r="2.6" fill="#8fb0d6"/>
+
+  <!-- 盘片 -->
+  <circle cx="63" cy="82" r="19" fill="url(#platter)" stroke="#9dbbe0" stroke-width="2.5"/>
+  <circle cx="63" cy="82" r="11.5" fill="none" stroke="#b7cde8" stroke-width="2"/>
+  <circle cx="63" cy="82" r="4.4" fill="#2c6ad4"/>
+  <!-- 磁头臂 -->
+  <path d="M94 60 L70 79" stroke="#8aa9cc" stroke-width="3.6" stroke-linecap="round"/>
+  <circle cx="94" cy="60" r="4.2" fill="#a9c3e0"/>
+
+  <!-- 清理星光 -->
+  <path d="M104 14 l4 10.8 10.8 4 -10.8 4 -4 10.8 -4 -10.8 -10.8 -4 10.8 -4 z"
+        fill="url(#spark)"/>
+  <circle cx="88" cy="22" r="2.6" fill="#fff7d6" fill-opacity="0.9"/>
+  <circle cx="117" cy="41" r="2" fill="#fff7d6" fill-opacity="0.65"/>
+</svg>

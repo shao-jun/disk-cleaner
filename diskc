@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+diskc —— UOS / Linux 磁盘垃圾清理工具
+
+按类别扫描可回收空间,带风险分级,默认只勾选"安全"项,删前一定给你看清楚。
+
+    diskc                    交互式:扫描 -> 勾选 -> 确认清理
+    diskc -n                 只扫描列清单(dry-run),不动任何文件
+    diskc -y -s              无人值守:清掉全部"安全"级项目
+    diskc -y -i 1,3,11-13    清理指定编号
+    diskc -d 60              时间阈值改成 60 天(影响"谨慎"级项目)
+    diskc -l                 列出类别后退出
+"""
+
+from __future__ import print_function
+
+import argparse
+import concurrent.futures
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+
+
+def _real_home():
+    """被 sudo / pkexec 提权运行时,仍以调用者的家目录为准"""
+    h = os.environ.get('HOME') or os.path.expanduser('~')
+    if os.geteuid() == 0:
+        try:
+            import pwd
+            u = os.environ.get('SUDO_USER')
+            if u and u != 'root':
+                return pwd.getpwnam(u).pw_dir
+            uid = os.environ.get('PKEXEC_UID')
+            if uid:
+                return pwd.getpwuid(int(uid)).pw_dir
+        except (KeyError, ValueError, ImportError):
+            pass
+    return h
+
+
+HOME = _real_home()
+DEVNULL = open(os.devnull, 'wb')
+SUDO = None          # 提权前缀(list)或 None
+DAYS = 30
+ENV = {}
+
+# ---------------------------------------------------------------- 小工具
+
+def hsize(n):
+    n = float(n)
+    for u in ('B', 'K', 'M', 'G', 'T'):
+        if n < 1024 or u == 'T':
+            if u == 'B':
+                return '%dB' % int(n)
+            return '%.1f%s' % (n, u)
+        n /= 1024.0
+
+
+def dw(s):
+    """显示宽度(中文算 2)"""
+    w = 0
+    for ch in s:
+        w += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+    return w
+
+
+def pad(s, width, right=False):
+    d = width - dw(s)
+    if d <= 0:
+        return s
+    return (' ' * d + s) if right else (s + ' ' * d)
+
+
+def is_root():
+    return SUDO is not None
+
+
+def run(cmd, use_sudo=False, timeout=180):
+    """跑命令,返回 (rc, stdout)"""
+    argv = list(cmd)
+    if use_sudo:
+        if SUDO is None:
+            return 1, ''
+        argv = list(SUDO) + argv
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = p.communicate(timeout=timeout)
+        return p.returncode, out.decode('utf-8', 'replace')
+    except Exception:
+        return 1, ''
+
+
+def path_size(p):
+    """单个文件/目录的真实占用(不跟随软链)"""
+    if os.path.islink(p):
+        return 0
+    if os.path.isfile(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+    total = 0
+    stack = [p]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def walk_old_files(root, days, exts=None, keywords=None, min_size=0):
+    """产出 root 下 mtime 早于 days 天的文件 -> (path, size)"""
+    cutoff = time.time() - days * 86400 if days else 0
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for base, dirs, files in os.walk(root, onerror=lambda e: None):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
+        for f in files:
+            low = f.lower()
+            if exts and not low.endswith(tuple(exts)):
+                continue
+            if keywords and not any(k in low for k in keywords):
+                continue
+            p = os.path.join(base, f)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if not os.path.isfile(p) or os.path.islink(p):
+                continue
+            if cutoff and st.st_mtime > cutoff:
+                continue
+            if st.st_size < min_size:
+                continue
+            out.append((p, st.st_size))
+    return out
+
+
+# ---------------------------------------------------------------- 企业微信定位
+
+WX_ROOT = os.path.join(HOME, 'Documents', 'WXWork')
+
+
+def wx_accounts():
+    out = []
+    if os.path.isdir(WX_ROOT):
+        for name in sorted(os.listdir(WX_ROOT)):
+            p = os.path.join(WX_ROOT, name)
+            if os.path.isdir(p) and name.isdigit():
+                out.append(p)
+    return out
+
+
+def wx_caches():
+    return [os.path.join(a, 'Cache') for a in wx_accounts()
+            if os.path.isdir(os.path.join(a, 'Cache'))]
+
+
+def wx_file_dirs():
+    return [os.path.join(c, 'File') for c in wx_caches()
+            if os.path.isdir(os.path.join(c, 'File'))]
+
+
+def looks_like_log_dir(path):
+    """目录是不是解压出来的日志包(含 var/log、varlog、log 等结构)"""
+    for sub in ('var/log', 'varlog', 'logs', 'log'):
+        if os.path.isdir(os.path.join(path, sub)):
+            return True
+    n = 0
+    try:
+        for base, dirs, files in os.walk(path, onerror=lambda e: None):
+            for f in files:
+                if f.lower().endswith('.log'):
+                    n += 1
+                    if n >= 5:
+                        return True
+            if base.count(os.sep) - path.count(os.sep) > 2:
+                dirs[:] = []
+    except OSError:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------- 各类扫描器
+
+def s_journal(days):
+    """systemd journal 持久化日志"""
+    items = []
+    rc, out = run(['journalctl', '--disk-usage'], use_sudo=True)
+    total = 0
+    m = re.search(r'([\d.]+)([KMGTP]?)', out or '')
+    if m and 'take up' in out:
+        mult = {'': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3,
+                'T': 1024 ** 4, 'P': 1024 ** 5}[m.group(2)]
+        total = int(float(m.group(1)) * mult)
+    keep = min(days, 7) if days else 7
+    if total == 0:
+        # 无 root 时 journalctl 读不到总量,退化为统计目录
+        jd = '/var/log/journal'
+        if os.path.isdir(jd):
+            total = path_size(jd)
+    if total > 32 * 1024 ** 2:
+        items.append(('journalctl --vacuum-time=%dd' % keep, total))
+    return items
+
+
+def s_apt(days):
+    items = []
+    for pat in ('/var/cache/apt/archives/*.deb',
+                '/var/cache/apt/archives/partial/*'):
+        for p in glob.glob(pat):
+            if os.path.isfile(p):
+                items.append((p, path_size(p)))
+    return items
+
+
+def s_coredump(days):
+    items = []
+    for root, kw in (('/var/crash', None),
+                     ('/var/lib/systemd/coredump', None),
+                     ('/var/tmp/core*', None)):
+        if root.endswith('*'):
+            for p in glob.glob(root):
+                items.append((p, path_size(p)))
+            continue
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            if name in ('.', '..'):
+                continue
+            p = os.path.join(root, name)
+            items.append((p, path_size(p)))
+    return items
+
+
+def s_vartmp(days):
+    d = 7 if days == 0 else min(days, 7)
+    items = []
+    root = '/var/tmp'
+    if not os.path.isdir(root):
+        return items
+    cutoff = time.time() - d * 86400
+    for name in os.listdir(root):
+        p = os.path.join(root, name)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if st.st_mtime > cutoff:
+            continue
+        items.append((p, path_size(p)))
+    return items
+
+
+ROTATED_RE = re.compile(r'\.(gz|xz|bz2|zst|old|bak)$|\.\d+$', re.I)
+
+
+def s_rotated_log(days):
+    items = []
+    root = '/var/log'
+    if not os.path.isdir(root):
+        return items
+    for base, dirs, files in os.walk(root, onerror=lambda e: None):
+        if os.path.join(root, 'journal') in base or base.endswith('/journal'):
+            dirs[:] = []
+            continue
+        for f in files:
+            if not ROTATED_RE.search(f):
+                continue
+            p = os.path.join(base, f)
+            if os.path.islink(p):
+                continue
+            items.append((p, path_size(p)))
+    return items
+
+
+APP_LOG_DIRS = ('uos', 'udcp-client', 'wpslog', 'lkt-hwdaemon', 'lkt-powertop',
+                'deepin-installer', 'deepin-deepinid-daemon', 'deepin',
+                'sunlogin', 'permission-manager', 'uos-ste', 'udcp')
+
+
+def s_app_log(days):
+    items = []
+    root = '/var/log'
+    for name in APP_LOG_DIRS:
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        items.extend(walk_old_files(d, days))
+    return items
+
+
+def s_thumbnails(days):
+    items = []
+    for root in (os.path.join(HOME, '.cache/thumbnails'),
+                 os.path.join(HOME, '.thumbnails')):
+        if os.path.isdir(root):
+            items.append((root, path_size(root)))
+    return items
+
+
+BUILD_CACHES = [
+    '.npm/_cacache', '.npm/_logs',
+    '.cache/pip', '.cache/node-gyp', '.cache/electron', '.cache/uv',
+    '.cache/go-build', '.cache/.bun', '.cache/yarn', '.cache/ms-playwright',
+    '.cache/ms-playwright-mcp', '.cache/chrome-devtools-mcp',
+    '.cache/opencode', '.cache/oh-my-opencode', '.cache/claude-cli-nodejs',
+    '.cache/typescript', '.cache/prisma', '.cache/torch', '.cache/huggingface',
+    '.cache/puppeteer', '.cache/typescript-go',
+    '.cache/mesa_shader_cache', '.cache/cherrystudio-updater',
+    '.gradle/caches', '.m2/repository/.cache', '.cargo/registry/cache',
+    '.local/share/uv/cache',
+]
+
+
+def s_build_cache(days):
+    items = []
+    for rel in BUILD_CACHES:
+        p = os.path.join(HOME, rel)
+        if not os.path.exists(p):
+            continue
+        sz = path_size(p)
+        if sz > 1024 ** 2:
+            items.append((p, sz))
+    return items
+
+
+def s_trash(days):
+    items = []
+    for rel in ('.local/share/Trash/files', '.local/share/Trash/expunged',
+                '.local/share/Trash/info'):
+        p = os.path.join(HOME, rel)
+        if not os.path.isdir(p):
+            continue
+        for name in os.listdir(p):
+            t = os.path.join(p, name)
+            items.append((t, path_size(t)))
+    return items
+
+
+CHROME_CACHE_NAMES = ('Cache', 'Code Cache', 'GPUCache', 'ShaderCache',
+                      'GrShaderCache', 'DawnGraphiteCache', 'DawnWebGPUCache',
+                      'CacheStorage', 'ScriptCache', 'component_crx_cache',
+                      'Media Cache', 'Application Cache')
+
+
+def _browser_cache_roots():
+    roots = []
+    for base in (os.path.join(HOME, '.cache/google-chrome'),
+                 os.path.join(HOME, '.config/google-chrome'),
+                 os.path.join(HOME, '.cache/microsoft-edge'),
+                 os.path.join(HOME, '.cache/chromium'),
+                 os.path.join(HOME, '.config/microsoft-edge'),
+                 os.path.join(HOME, '.cache/BraveSoftware')):
+        if os.path.isdir(base):
+            roots.append(base)
+    return roots
+
+
+def s_browser_cache(days):
+    items = []
+    for base in _browser_cache_roots():
+        for root, dirs, files in os.walk(base, onerror=lambda e: None):
+            depth = root.count(os.sep) - base.count(os.sep)
+            if depth > 4:
+                dirs[:] = []
+                continue
+            keep = []
+            for d in list(dirs):
+                if d in CHROME_CACHE_NAMES:
+                    p = os.path.join(root, d)
+                    sz = path_size(p)
+                    if sz > 1024 ** 2:
+                        items.append((p, sz))
+                else:
+                    keep.append(d)
+            dirs[:] = keep
+    return items
+
+
+def s_wx_temp(days):
+    """企业微信未完成的下载残留 + Temp 目录"""
+    items = []
+    for fd in wx_file_dirs():
+        items.extend(walk_old_files(fd, 0, exts=('.p2p.download', '.temp',
+                                                 '.part', '.download', '.crdownload')))
+        tmp = os.path.join(fd, 'Temp')
+        if os.path.isdir(tmp):
+            for name in os.listdir(tmp):
+                p = os.path.join(tmp, name)
+                items.append((p, path_size(p)))
+    return items
+
+
+LOG_KW = ('log', '日志', 'var', 'dmesg', 'journal', 'syslog')
+ARCHIVE_EXT = ('.zip', '.7z', '.tar.gz', '.tgz', '.tar.xz', '.tar.bz2',
+               '.rar', '.tar')
+
+
+def s_wx_logpkg(days):
+    """企业微信里下载的日志压缩包"""
+    items = []
+    for fd in wx_file_dirs():
+        items.extend(walk_old_files(fd, days, exts=ARCHIVE_EXT, keywords=LOG_KW,
+                                    min_size=1024 * 100))
+    return items
+
+
+def s_wx_extract(days):
+    """企业微信里解压后的日志文件夹"""
+    cutoff = time.time() - days * 86400 if days else 0
+    items = []
+    for fd in wx_file_dirs():
+        for sub in sorted(os.listdir(fd)):
+            subp = os.path.join(fd, sub)
+            if not os.path.isdir(subp) or sub == 'Temp':
+                continue
+            try:
+                entries = os.listdir(subp)
+            except OSError:
+                continue
+            for name in entries:
+                p = os.path.join(subp, name)
+                if not os.path.isdir(p):
+                    continue
+                low = name.lower()
+                named = any(k in low for k in ('var-log', 'varlog', 'logs',
+                                               'log-', '-log', 'all_log',
+                                               'syslog', 'dmesg'))
+                if not (named or looks_like_log_dir(p)):
+                    continue
+                try:
+                    stamp = os.lstat(p).st_mtime
+                except OSError:
+                    continue
+                if cutoff and stamp > cutoff:
+                    continue
+                items.append((p, path_size(p)))
+    return items
+
+
+def s_deb(days):
+    """下载目录里的 deb 安装包"""
+    items = []
+    roots = [os.path.join(HOME, 'Downloads'), os.path.join(HOME, '桌面'),
+             os.path.join(HOME, 'Desktop'), os.path.join(HOME, 'Documents/下载')]
+    for r in roots:
+        items.extend(walk_old_files(r, days, exts=('.deb', '.rpm', '.appimage')))
+    for fd in wx_file_dirs():
+        items.extend(walk_old_files(fd, days, exts=('.deb', '.rpm', '.appimage')))
+    return items
+
+
+VIDEO_EXT = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm',
+             '.m4v', '.ts', '.mpg', '.mpeg', '.rmvb')
+
+
+def s_video(days):
+    """下载/录屏视频"""
+    items = []
+    roots = [os.path.join(HOME, 'Downloads'), os.path.join(HOME, 'Videos'),
+             os.path.join(HOME, '视频'), os.path.join(HOME, 'Desktop'),
+             os.path.join(HOME, '桌面')]
+    for r in roots:
+        items.extend(walk_old_files(r, days, exts=VIDEO_EXT, min_size=1024 ** 2))
+    for c in wx_caches():
+        v = os.path.join(c, 'Video')
+        if os.path.isdir(v):
+            items.extend(walk_old_files(v, days, exts=VIDEO_EXT))
+    return items
+
+
+def s_wx_cef(days):
+    """企业微信网页内核缓存"""
+    items = []
+    roots = [os.path.join(WX_ROOT, 'qtCef')]
+    roots += [os.path.join(a, 'WXWorkCefCache') for a in wx_accounts()]
+    roots += [os.path.join(a, 'Profiles') for a in wx_accounts()]
+    for base in roots:
+        if not os.path.isdir(base):
+            continue
+        if base.endswith('Profiles'):
+            continue
+        for root, dirs, files in os.walk(base, onerror=lambda e: None):
+            if root.count(os.sep) - base.count(os.sep) > 3:
+                dirs[:] = []
+                continue
+            keep = []
+            for d in list(dirs):
+                if d in CHROME_CACHE_NAMES or d in ('Cache', 'GPUCache',
+                                                    'Code Cache',
+                                                    'blob_storage'):
+                    p = os.path.join(root, d)
+                    sz = path_size(p)
+                    if sz > 1024 ** 2:
+                        items.append((p, sz))
+                else:
+                    keep.append(d)
+            dirs[:] = keep
+    return items
+
+
+def s_wx_image(days):
+    """企业微信聊天图片 / 表情缓存(删了历史图片要重新拉)"""
+    items = []
+    for a in wx_accounts():
+        for sub in ('Cache/Image', 'Emotion'):
+            p = os.path.join(a, sub)
+            if os.path.isdir(p):
+                items.append((p, path_size(p)))
+        i = os.path.join(a, 'Cache', 'Image')
+        if os.path.isdir(i) and not any(x[0] == i for x in items):
+            items.append((i, path_size(i)))
+    return items
+
+
+def s_wine_cache(days):
+    """Wine 容器里的临时文件 / 缓存"""
+    items = []
+    base = os.path.join(HOME, '.deepinwine')
+    if not os.path.isdir(base):
+        return items
+    cands = []
+    for cont in sorted(os.listdir(base)):
+        c = os.path.join(base, cont)
+        if not os.path.isdir(c):
+            continue
+        drive = os.path.join(c, 'drive_c')
+        if not os.path.isdir(drive):
+            continue
+        cands.append(os.path.join(drive, 'windows', 'temp'))
+        users = os.path.join(drive, 'users')
+        if os.path.isdir(users):
+            for u in os.listdir(users):
+                ud = os.path.join(users, u)
+                if not os.path.isdir(ud):
+                    continue
+                cands.append(os.path.join(ud, 'AppData', 'Local', 'Temp'))
+                cands.append(os.path.join(ud, 'Local Settings', 'Temp'))
+                for appdata in (os.path.join(ud, 'AppData', 'Local'),
+                                os.path.join(ud, 'Local Settings')):
+                    if not os.path.isdir(appdata):
+                        continue
+                    try:
+                        for d in os.listdir(appdata):
+                            if d.lower() in ('cache', 'temp', 'tmp',
+                                             'temporary internet files'):
+                                cands.append(os.path.join(appdata, d))
+                    except OSError:
+                        pass
+    seen = set()
+    for p in cands:
+        if p in seen or not os.path.isdir(p):
+            continue
+        seen.add(p)
+        sz = path_size(p)
+        if sz > 10 * 1024 ** 2:
+            items.append((p, sz))
+    return items
+
+
+# key, 标题, 风险, 描述, 扫描函数, 需 root, 默认勾选, 受天数影响
+CATALOG = [
+    ('journal', '系统 journald 日志', 'safe', 'systemd 日志,只保留最近 7 天',
+     s_journal, True, True, False),
+    ('apt', 'apt 安装包缓存', 'safe', '/var/cache/apt/archives 里的 deb,装完就没用了',
+     s_apt, True, True, False),
+    ('coredump', '崩溃转储文件', 'safe', '/var/crash 与 coredump,程序崩溃的现场',
+     s_coredump, True, True, False),
+    ('vartmp', '系统临时文件', 'safe', '/var/tmp 里 7 天前的临时文件',
+     s_vartmp, True, True, False),
+    ('rotated', '轮转旧日志', 'safe', '/var/log 下 *.gz / *.1 这类归档日志',
+     s_rotated_log, True, True, False),
+    ('applog', '应用日志目录', 'careful', '/var/log 下 uos、udcp-client、wpslog 等旧日志',
+     s_app_log, True, False, True),
+    ('thumb', '缩略图缓存', 'safe', '文件管理器/图库缩略图,会自动重建',
+     s_thumbnails, False, True, False),
+    ('build', '开发构建缓存', 'safe', 'npm/pip/node-gyp/electron/uv/go 等下载缓存,需要时自动重下',
+     s_build_cache, False, True, False),
+    ('trash', '回收站', 'safe', '回收站里已删除的文件',
+     s_trash, False, True, False),
+    ('chrome', '浏览器缓存', 'careful', 'Chrome/Edge 网页缓存,清了网页首次打开变慢,登录态不受影响',
+     s_browser_cache, False, False, False),
+    ('wx-temp', '企微下载残留', 'safe', '*.P2P.DOWNLOAD / *.temp / Temp 目录,没下完的碎片',
+     s_wx_temp, False, True, False),
+    ('wx-logpkg', '企微日志压缩包', 'careful', '企业微信里下载的 log/var 日志包(压缩态)',
+     s_wx_logpkg, False, False, True),
+    ('wx-extract', '企微解压日志目录', 'careful', '解压出来的 var/log、varlog 等日志文件夹',
+     s_wx_extract, False, False, True),
+    ('deb', '下载的安装包 deb/AppImage', 'careful', '下载/企微里的 deb、AppImage,装过就不会再用',
+     s_deb, False, False, True),
+    ('video', '下载的视频', 'careful', '下载/录屏/企微视频文件,删前确认不是工作证据',
+     s_video, False, False, True),
+    ('wx-cef', '企微网页内核缓存', 'careful', 'qtCef 缓存,清了企微内嵌网页/文档首次加载变慢',
+     s_wx_cef, False, False, False),
+    ('wx-image', '企微聊天图片', 'risky', 'Cache/Image 与表情缓存,删后历史图片需重新下载',
+     s_wx_image, False, False, False),
+    ('wine', 'Wine 容器临时文件', 'careful', 'deepinwine 里各 Windows 应用的 Temp/Cache',
+     s_wine_cache, False, False, False),
+]
+
+RISK_LABEL = {'safe': '安全', 'careful': '谨慎', 'risky': '高风险'}
+RISK_COLOR = {'safe': '\033[32m', 'careful': '\033[33m', 'risky': '\033[31m'}
+
+
+# ---------------------------------------------------------------- 展示
+
+def scan_all(days, only=None, verbose=True):
+    results = {}
+    cats = [c for c in CATALOG if not only or c[0] in only]
+    if verbose:
+        sys.stdout.write('扫描中...\n')
+        sys.stdout.flush()
+
+    def work(c):
+        key, title, risk, desc, fn, need_root, picked, day_aware = c
+        try:
+            items = fn(days)
+        except Exception as e:
+            return key, [], '扫描失败: %s' % e
+        if need_root and SUDO is None:
+            # 无 root 也能读到大小(stat 不需要文件读权限),只是清理时需要提权
+            return key, items, '需管理员权限,仅预览'
+        return key, items, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(work, c) for c in cats]
+        for f in concurrent.futures.as_completed(futs):
+            k, items, err = f.result()
+            results[k] = {'items': items, 'err': err}
+    return results
+
+
+def cat_by_key(key):
+    for c in CATALOG:
+        if c[0] == key:
+            return c
+    return None
+
+
+def render(results, selected, days):
+    print()
+    hdr = ' %s %s %s %s %s' % (pad('#', 3), pad('类别', 22), pad('风险', 6),
+                               pad('可释放', 9, True), ' 说明')
+    print('\033[1m' + hdr + '\033[0m')
+    print(' ' + '-' * 96)
+    idx_map = {}
+    total_sel = 0
+    i = 0
+    for c in CATALOG:
+        key, title, risk, desc, fn, need_root, picked, day_aware = c
+        if key not in results:
+            continue
+        i += 1
+        idx_map[i] = key
+        r = results[key]
+        items = r['items']
+        size = sum(s for _, s in items)
+        if key in selected:
+            total_sel += size
+        mark = '\033[7m x \033[0m' if key in selected else '   '
+        color = RISK_COLOR[risk]
+        line = ' %s %s %s%s\033[0m %s  %s' % (
+            mark, pad(title, 22), color, pad(RISK_LABEL[risk], 6),
+            pad(hsize(size), 9, True), desc)
+        if r['err']:
+            line += '  \033[31m(%s)\033[0m' % r['err']
+        elif items:
+            line += '  \033[90m%d 项\033[0m' % len(items)
+        print(line)
+    print(' ' + '-' * 96)
+    print(' 已选 \033[1m%s\033[0m  |  阈值 %d 天  |  %s' %
+          (hsize(total_sel), days,
+           '管理员权限: 有' if SUDO is not None else '管理员权限: 无(系统类目跳过)'))
+    return idx_map
+
+
+def details(key, results, limit=40):
+    r = results.get(key)
+    if not r:
+        return
+    c = cat_by_key(key)
+    print('\n\033[1m%s\033[0m — %s' % (c[1], c[3]))
+    items = sorted(r['items'], key=lambda x: -x[1])
+    print('共 %d 项,合计 %s\n' % (len(items), hsize(sum(s for _, s in items))))
+    for p, s in items[:limit]:
+        print('  %9s  %s' % (hsize(s), p))
+    if len(items) > limit:
+        print('  ... 还有 %d 项' % (len(items) - limit))
+    print()
+
+
+# ---------------------------------------------------------------- 执行清理
+
+def delete_targets(items, use_sudo):
+    """返回 (释放字节, 删除项数, 失败列表)"""
+    freed = 0
+    ok = 0
+    failed = []
+    plain = use_sudo is False
+    batch = []
+    for path, size in items:
+        if path.startswith('journalctl --'):
+            continue
+        batch.append((path, size))
+        if len(batch) >= 200:
+            f, o, e = _flush(batch, use_sudo)
+            freed += f
+            ok += o
+            failed.extend(e)
+            batch = []
+    if batch:
+        f, o, e = _flush(batch, use_sudo)
+        freed += f
+        ok += o
+        failed.extend(e)
+    return freed, ok, failed
+
+
+def _flush(batch, use_sudo):
+    freed = 0
+    ok = 0
+    failed = []
+    if use_sudo:
+        paths = [p for p, _ in batch]
+        argv = list(SUDO) + ['rm', '-rf', '--'] + paths
+        try:
+            rc = subprocess.call(argv, stdout=DEVNULL, stderr=DEVNULL)
+        except Exception:
+            rc = 1
+        for p, s in batch:
+            if not os.path.exists(p):
+                freed += s
+                ok += 1
+            else:
+                failed.append(p)
+        return freed, ok, failed
+    for p, s in batch:
+        try:
+            if os.path.islink(p) or os.path.isfile(p):
+                os.remove(p)
+            elif os.path.isdir(p):
+                shutil.rmtree(p, onerror=lambda f, pa, exc: None)
+            else:
+                continue
+            freed += s
+            ok += 1
+        except OSError as e:
+            failed.append('%s (%s)' % (p, e.strerror))
+    return freed, ok, failed
+
+
+def wx_running():
+    rc, out = run(['pgrep', '-f', 'WXWork|wxwork|WXWorkWeb'])
+    return out.strip() != ''
+
+
+def do_clean(keys, results, days, assume_yes=False):
+    plan = []
+    for key in keys:
+        r = results.get(key)
+        if not r:
+            continue
+        plan.extend([(p, s, key) for p, s in r['items']])
+    if not plan:
+        print('\n没有可清理的内容。')
+        return 0
+
+    total = sum(s for _, s, _ in plan)
+    print('\n\033[1m即将清理\033[0m: %d 项,合计 \033[1m%s\033[0m' % (len(plan), hsize(total)))
+    if any(k.startswith('wx') for k in keys) and wx_running():
+        print('\033[33m提示: 企业微信正在运行,建议退出后再清理它的缓存,'
+              '否则可能遇到文件占用。\033[0m')
+    for key in keys:
+        c = cat_by_key(key)
+        sz = sum(s for p, s, k in plan if k == key)
+        print('  · %-24s %s' % (c[1], hsize(sz)))
+    if not assume_yes:
+        try:
+            ans = input('\n确认删除?输入 yes 继续: ').strip().lower()
+        except EOFError:
+            return 1
+        if ans != 'yes':
+            print('已取消,什么都没删。')
+            return 1
+
+    # journal 用 vacuum
+    if 'journal' in keys:
+        keep = min(days, 7) if days else 7
+        print('\n  -> journalctl --vacuum-time=%dd ...' % keep)
+        rc, out = run(['journalctl', '--vacuum-time=%dd' % keep], use_sudo=True)
+        m = re.search(r'freed ([\d.]+)([KMG])', out)
+        if m:
+            mult = {'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3}[m.group(2)]
+            print('     释放 %s' % hsize(float(m.group(1)) * mult))
+
+    items = [(p, s) for p, s, k in plan if not p.startswith('journalctl --')]
+    sys_log = any(cat_by_key(k)[5] for k in keys)
+    use_sudo = SUDO is not None and sys_log
+    freed = 0
+    if items:
+        freed, ok, failed = delete_targets(items, use_sudo)
+        print('\n  -> 已删除 %d 项,回收 \033[32m%s\033[0m' % (ok, hsize(freed)))
+        if failed:
+            print('     %d 项删除失败(权限或占用),例如:' % len(failed))
+            for f in failed[:5]:
+                print('       %s' % f)
+
+    remaining = _disk_free()
+    print('\n磁盘可用空间: \033[1m%s\033[0m' % remaining)
+    if not sys_log and SUDO is None:
+        print('提示: 系统日志类目因缺少管理员权限未清理,用 sudo diskc 可以一并处理。')
+    return 0
+
+
+def _disk_free():
+    try:
+        st = os.statvfs(HOME)
+        return hsize(st.f_bavail * st.f_frsize)
+    except OSError:
+        return '?'
+
+
+# ---------------------------------------------------------------- 主流程
+
+def parse_sel(s, idx_map):
+    out = []
+    for part in s.replace(' ', ',').split(','):
+        if not part:
+            continue
+        if '-' in part:
+            try:
+                a, b = part.split('-', 1)
+                a, b = int(a), int(b)
+                for n in range(a, b + 1):
+                    if n in idx_map:
+                        out.append(idx_map[n])
+            except ValueError:
+                pass
+        else:
+            try:
+                n = int(part)
+                if n in idx_map:
+                    out.append(idx_map[n])
+            except ValueError:
+                pass
+    return out
+
+
+def init_sudo():
+    global SUDO
+    if os.geteuid() == 0:
+        SUDO = []
+        return
+    rc, _ = run(['sudo', '-n', 'true'])
+    if rc == 0:
+        SUDO = ['sudo', '-n']
+        return
+    if sys.stdin.isatty():
+        print('清理系统日志需要管理员权限。输入密码(直接回车跳过系统类目):')
+        try:
+            if subprocess.call(['sudo', '-v']) == 0:
+                SUDO = ['sudo', '-n']
+                return
+        except Exception:
+            pass
+    SUDO = None
+
+
+def main():
+    global DAYS
+    ap = argparse.ArgumentParser(add_help=True, description='UOS 磁盘垃圾清理工具')
+    ap.add_argument('-n', '--dry-run', action='store_true', help='只扫描列清单')
+    ap.add_argument('-y', '--yes', action='store_true', help='不询问直接执行')
+    ap.add_argument('-s', '--safe', action='store_true', help='只处理安全级项目')
+    ap.add_argument('-a', '--all-risk', action='store_true', help='安全+谨慎级全选')
+    ap.add_argument('-i', '--items', default='', help='指定编号,如 1,3,11-13')
+    ap.add_argument('--keys', default='', help='按类别 key 指定,如 journal,apt,rotated')
+    ap.add_argument('-d', '--days', type=int, default=30, help='时间阈值(天),默认 30')
+    ap.add_argument('-l', '--list', action='store_true', help='只列类别说明')
+    args = ap.parse_args()
+
+    DAYS = args.days
+
+    if args.list:
+        for i, c in enumerate(CATALOG, 1):
+            print('%2d  %s%-8s\033[0m %-24s %s'
+                  % (i, RISK_COLOR[c[2]], RISK_LABEL[c[2]], c[1], c[3]))
+        return 0
+
+    init_sudo()
+    results = scan_all(DAYS)
+
+    if args.keys:
+        selected = set(k.strip() for k in args.keys.split(',') if k.strip() in results)
+    elif args.items:
+        tmp = {}
+        i = 0
+        for c in CATALOG:
+            if c[0] in results:
+                i += 1
+                tmp[i] = c[0]
+        selected = set(parse_sel(args.items, tmp))
+    elif args.safe:
+        selected = set(c[0] for c in CATALOG if c[6] and c[0] in results)
+    elif args.all_risk:
+        selected = set(c[0] for c in CATALOG if c[2] in ('safe', 'careful')
+                       and c[0] in results)
+    else:
+        selected = set(c[0] for c in CATALOG if c[6] and c[0] in results)
+
+    if args.dry_run or args.yes:
+        render(results, selected, DAYS)
+        if args.dry_run:
+            print('\n(dry-run:未删除任何文件。去掉 -n 即可交互清理)')
+            return 0
+        return do_clean(selected, results, DAYS, assume_yes=True)
+
+    # 交互
+    while True:
+        idx_map = render(results, selected, DAYS)
+        print('\n命令: [编号]切换  a=全选安全  b=安全+谨慎  n=清空  d<N>=详情  '
+              'r=重扫  q=退出  \033[1m回车=开始清理\033[0m')
+        try:
+            cmd = input('> ').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if cmd == '':
+            if not selected:
+                print('没有选中任何项目。')
+                continue
+            return do_clean(selected, results, DAYS)
+        if cmd == 'q':
+            print('退出,未做任何修改。')
+            return 0
+        if cmd == 'a':
+            selected = set(c[0] for c in CATALOG if c[6] and c[0] in results)
+            continue
+        if cmd == 'b':
+            selected = set(c[0] for c in CATALOG if c[2] in ('safe', 'careful')
+                           and c[0] in results)
+            continue
+        if cmd == 'n':
+            selected = set()
+            continue
+        if cmd == 'r':
+            results = scan_all(DAYS)
+            continue
+        if cmd.startswith('d'):
+            rest = cmd[1:].strip()
+            if rest.isdigit() and int(rest) in idx_map:
+                details(idx_map[int(rest)], results)
+            else:
+                print('用法: d3  (查看第 3 项明细)')
+            continue
+        keys = parse_sel(cmd, idx_map)
+        if not keys:
+            print('无法识别的命令。')
+            continue
+        for k in keys:
+            if k in selected:
+                selected.discard(k)
+            else:
+                selected.add(k)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        print('\n已中断。')
+        sys.exit(130)

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Disk Cleaner
+Name[zh_CN]=磁盘垃圾清理
+GenericName=Disk Cleaner
+Comment=Scan and clean system logs, packages, WeCom cache and other junk files
+Comment[zh_CN]=扫描并清理系统日志、安装包、企业微信缓存等垃圾文件
+Exec=@EXEC@
+Icon=diskc
+Terminal=false
+Categories=System;Utility;
+Keywords=disk;clean;junk;cache;清理;垃圾;磁盘;缓存;
+StartupNotify=false

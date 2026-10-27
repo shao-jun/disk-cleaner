@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+diskc-gui —— 磁盘垃圾清理(图形界面)
+
+扫描 → 左侧勾选类别 → 右侧查看明细 → 清理选中。
+系统级项目(日志/apt/coredump)需要管理员权限,会转交终端执行。
+"""
+
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gdk, Gio, Pango, GObject  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+DISKC = os.path.join(HERE, 'diskc')
+
+from importlib.machinery import SourceFileLoader  # noqa: E402
+CORE = SourceFileLoader('diskc_core', DISKC).load_module()
+
+RISK_COLOR = {'safe': '#2e7d32', 'careful': '#b26a00', 'risky': '#c62828'}
+RISK_LABEL = {'safe': '安全', 'careful': '谨慎', 'risky': '高风险'}
+
+# ---- ListStore 列定义
+C_SEL, C_TITLE, C_RISK, C_RISKCOL, C_SIZE, C_COUNT, C_NOTE, C_KEY, C_ROOT = range(9)
+
+
+def hsize(n):
+    return CORE.hsize(n)
+
+
+def disk_usage(path):
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        return total, total - free, free
+    except OSError:
+        return 0, 0, 0
+
+
+class Cleaner(Gtk.Window):
+
+    def __init__(self):
+        Gtk.Window.__init__(self, title='磁盘垃圾清理')
+        self.set_default_size(1080, 720)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect('destroy', Gtk.main_quit)
+
+        self.days = 30
+        self.results = {}
+        self.idx = {}          # key -> 显示序号
+        self.scanning = False
+        self.cleaning = False
+        self.first_scan = True
+        self.pending_select = None
+
+        self._build_css()
+        self._build_ui()
+        self.rescan()
+
+    # ------------------------------------------------------------ 外观
+
+    def _build_css(self):
+        css = b"""
+        .dim { color: #888888; }
+        .total { font-weight: bold; font-size: 15px; }
+        progressbar trough { min-height: 8px; }
+        """
+        prov = Gtk.CssProvider()
+        prov.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ------------------------------------------------------------ 界面
+
+    def _build_ui(self):
+        hb = Gtk.HeaderBar()
+        hb.set_show_close_button(True)
+        hb.set_title('磁盘垃圾清理')
+        hb.set_subtitle('勾选左侧项目加入清理 · 点击某行查看具体文件')
+        self.set_titlebar(hb)
+
+        self.spinner = Gtk.Spinner()
+        hb.pack_start(self.spinner)
+
+        btn_rescan = Gtk.Button(label='重新扫描')
+        btn_rescan.connect('clicked', lambda *a: self.rescan())
+        hb.pack_end(btn_rescan)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(box)
+
+        # ---- 顶部:磁盘用量 + 阈值
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        top.set_border_width(10)
+        box.pack_start(top, False, False, 0)
+
+        self.disk_label = Gtk.Label()
+        self.disk_label.set_xalign(0)
+        top.pack_start(self.disk_label, False, False, 0)
+
+        self.disk_bar = Gtk.ProgressBar()
+        self.disk_bar.set_size_request(200, -1)
+        top.pack_start(self.disk_bar, False, False, 0)
+
+        top.pack_start(Gtk.Label(label='  时间阈值:'), False, False, 0)
+        self.combo = Gtk.ComboBoxText()
+        for label, d in (('30 天内不动过的', 30), ('60 天', 60),
+                         ('90 天', 90), ('180 天', 180), ('不限时间', 0)):
+            self.combo.append(str(d), label)
+        self.combo.set_active_id('30')
+        self.combo.connect('changed', self._on_days_changed)
+        top.pack_start(self.combo, False, False, 0)
+
+        btn_none = Gtk.Button(label='清空选择')
+        btn_none.connect('clicked', lambda *a: self.select_by_risk(()))
+        top.pack_end(btn_none, False, False, 0)
+
+        btn_safe = Gtk.Button(label='全选安全项')
+        btn_safe.connect('clicked', lambda *a: self.select_by_risk(('safe',)))
+        top.pack_end(btn_safe, False, False, 0)
+
+        box.pack_start(Gtk.Separator(), False, False, 0)
+
+        # ---- 主体:左类别 / 右明细
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(660)
+        box.pack_start(paned, True, True, 0)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        paned.add1(left)
+
+        self.cat_store = Gtk.ListStore(bool, str, str, str, str, str, str, str, bool)
+        tv = Gtk.TreeView(model=self.cat_store)
+        tv.set_enable_search(False)
+
+        r = Gtk.CellRendererToggle()
+        r.connect('toggled', self._on_toggle)
+        c = Gtk.TreeViewColumn('', r, active=C_SEL)
+        c.set_fixed_width(34)
+        tv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        r.set_property('ellipsize', Pango.EllipsizeMode.END)
+        c = Gtk.TreeViewColumn('类别', r, text=C_TITLE)
+        c.set_expand(True)
+        c.set_min_width(170)
+        tv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        c = Gtk.TreeViewColumn('风险', r, text=C_RISK, foreground=C_RISKCOL)
+        c.set_fixed_width(62)
+        tv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        r.set_property('xalign', 1.0)
+        c = Gtk.TreeViewColumn('可释放', r, text=C_SIZE)
+        c.set_fixed_width(84)
+        tv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        r.set_property('xalign', 1.0)
+        c = Gtk.TreeViewColumn('项数', r, text=C_COUNT)
+        c.set_fixed_width(56)
+        tv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        r.set_property('foreground', '#888888')
+        r.set_property('ellipsize', Pango.EllipsizeMode.END)
+        c = Gtk.TreeViewColumn('备注', r, text=C_NOTE)
+        c.set_fixed_width(80)
+        tv.append_column(c)
+
+        tv.connect('query-tooltip', self._on_tooltip)
+        tv.set_has_tooltip(True)
+        self.cat_tv = tv
+        self.cat_sel = tv.get_selection()
+        self.cat_sel.connect('changed', self._on_cat_selected)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_overlay_scrolling(False)
+        sw.add(tv)
+        left.pack_start(sw, True, True, 0)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        paned.add2(right)
+
+        self.detail_head = Gtk.Label()
+        self.detail_head.set_xalign(0)
+        self.detail_head.set_ellipsize(Pango.EllipsizeMode.END)
+        self.detail_head.set_markup('<span size="small" color="#888888">'
+                                    '点击左侧类别查看文件 · 双击某一项可在文件管理器中定位</span>')
+        self.detail_head.set_margin_start(10)
+        self.detail_head.set_margin_end(8)
+        self.detail_head.set_margin_top(9)
+        self.detail_head.set_margin_bottom(5)
+        right.pack_start(self.detail_head, False, False, 0)
+
+        # 第一列必须是 64 位:单个项目可超过 2G(< 2^31),用 int 会溢出导致明细整片空白
+        self.detail_store = Gtk.ListStore(GObject.TYPE_INT64, str, str, str)
+        dtv = Gtk.TreeView(model=self.detail_store)
+        dtv.set_enable_search(False)
+
+        r = Gtk.CellRendererText()
+        r.set_property('xalign', 1.0)
+        c = Gtk.TreeViewColumn('大小', r, text=1)
+        c.set_fixed_width(78)
+        c.set_sort_column_id(0)
+        dtv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        c = Gtk.TreeViewColumn('修改时间', r, text=2)
+        c.set_fixed_width(122)
+        dtv.append_column(c)
+
+        r = Gtk.CellRendererText()
+        r.set_property('ellipsize', Pango.EllipsizeMode.MIDDLE)
+        c = Gtk.TreeViewColumn('路径', r, text=3)
+        c.set_expand(True)
+        dtv.append_column(c)
+
+        sw2 = Gtk.ScrolledWindow()
+        sw2.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw2.set_overlay_scrolling(False)
+        sw2.add(dtv)
+        right.pack_start(sw2, True, True, 0)
+        dtv.set_has_tooltip(True)
+        dtv.connect('query-tooltip', self._on_detail_tooltip)
+        dtv.connect('row-activated', self._on_detail_activate)
+        dtv.connect('button-press-event', self._on_detail_click)
+        self.detail_tv = dtv
+
+        box.pack_start(Gtk.Separator(), False, False, 0)
+
+        # ---- 底栏
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bottom.set_border_width(10)
+        box.pack_start(bottom, False, False, 0)
+
+        self.sum_label = Gtk.Label()
+        self.sum_label.set_xalign(0)
+        self.sum_label.get_style_context().add_class('total')
+        bottom.pack_start(self.sum_label, True, True, 0)
+
+        self.status = Gtk.Label()
+        self.status.get_style_context().add_class('dim')
+        bottom.pack_start(self.status, False, False, 0)
+
+        self.clean_btn = Gtk.Button(label='清理选中')
+        self.clean_btn.get_style_context().add_class('suggested-action')
+        self.clean_btn.connect('clicked', self._on_clean)
+        bottom.pack_end(self.clean_btn, False, False, 0)
+
+        self.update_disk_label()
+        self.update_summary()
+
+    # ------------------------------------------------------------ 磁盘用量
+
+    def update_disk_label(self):
+        total, used, free = disk_usage(CORE.HOME)
+        pct = (100.0 * used / total) if total else 0
+        self.disk_label.set_markup(
+            '磁盘 <b>%s</b> / %s 已用(%.0f%%),可用 <b>%s</b>'
+            % (hsize(used), hsize(total), pct, hsize(free)))
+        self.disk_bar.set_fraction(min(pct / 100.0, 1.0))
+        self.disk_bar.set_text('%.0f%%' % pct)
+
+    # ------------------------------------------------------------ 扫描
+
+    def _on_days_changed(self, combo):
+        d = int(combo.get_active_id() or 30)
+        if d == self.days:
+            return
+        self.days = d
+        self.rescan()
+
+    def rescan(self):
+        if self.scanning or self.cleaning:
+            return
+        self.scanning = True
+        self.spinner.start()
+        self.status.set_text('扫描中…')
+        checked = set(self.checked_keys())
+        threading.Thread(target=self._scan_worker, args=(self.days, checked),
+                         daemon=True).start()
+
+    def _scan_worker(self, days, checked):
+        try:
+            res = CORE.scan_all(days, verbose=False)
+        except Exception as e:      # 兜底,别让线程静默死掉
+            res = {}
+        GLib.idle_add(self._scan_done, res, checked)
+
+    def _scan_done(self, res, checked):
+        self.results = res
+        self.cat_store.clear()
+        self.idx = {}
+        i = 0
+        for cat in CORE.CATALOG:
+            key = cat[0]
+            if key not in res:
+                continue
+            i += 1
+            self.idx[key] = i
+            title, risk = cat[1], cat[2]
+            need_root = cat[5]
+            r = res[key]
+            size = sum(s for _, s in r['items'])
+            note = ''
+            if r.get('err'):
+                note = '需密码' if need_root else '出错'
+            elif need_root:
+                note = '需密码'
+            sel = key in checked
+            if self.first_scan and cat[6]:
+                sel = True
+            self.cat_store.append([
+                sel, title, RISK_LABEL[risk], RISK_COLOR[risk],
+                hsize(size), str(len(r['items'])), note, key, need_root])
+        self.first_scan = False
+        self.spinner.stop()
+        self.scanning = False
+        total = sum(sum(x[1] for x in res[k]['items']) for k in res)
+        self.status.set_text('扫描完成,共 %d 类 / %s' % (len(self.idx), hsize(total)))
+        self.update_disk_label()
+        self.update_summary()
+        self._select_first_row()
+        if self.pending_select:
+            n, self.pending_select = self.pending_select, None
+            self.select_row(n)
+
+    def _select_first_row(self):
+        it = self.cat_store.get_iter_first()
+        if it:
+            self.cat_sel.select_iter(it)
+
+    def select_row(self, n):
+        """按显示序号选中某一行(供截图/脚本验证用)"""
+        if self.scanning or self.cat_store.get_iter_first() is None:
+            self.pending_select = n
+            return
+        it = self.cat_store.get_iter_first()
+        i = 1
+        while it is not None and i < n:
+            it = self.cat_store.iter_next(it)
+            i += 1
+        if it is not None:
+            self.cat_sel.select_iter(it)
+            self.cat_tv.scroll_to_cell(self.cat_store.get_path(it), None, False, 0, 0)
+
+    # ------------------------------------------------------------ 选择
+
+    def _on_toggle(self, renderer, path):
+        it = self.cat_store.get_iter(path)
+        cur = self.cat_store.get_value(it, C_SEL)
+        self.cat_store.set_value(it, C_SEL, not cur)
+        self.update_summary()
+
+    def checked_keys(self):
+        return [row[C_KEY] for row in self.cat_store if row[C_SEL]]
+
+    def select_by_risk(self, risks):
+        risk_of = dict((c[0], c[2]) for c in CORE.CATALOG)
+        for row in self.cat_store:
+            row[C_SEL] = risk_of.get(row[C_KEY]) in risks
+        self.update_summary()
+
+    def selected_size(self):
+        total = 0
+        for key in self.checked_keys():
+            r = self.results.get(key)
+            if r:
+                total += sum(s for _, s in r['items'])
+        return total
+
+    def update_summary(self):
+        keys = self.checked_keys()
+        size = self.selected_size()
+        self.sum_label.set_markup('已选 %d 类,合计 <b>%s</b>'
+                                  % (len(keys), hsize(size)))
+        self.clean_btn.set_sensitive(bool(keys) and not self.scanning
+                                     and not self.cleaning)
+        if keys:
+            self.clean_btn.set_label('清理选中(%s)' % hsize(size))
+        else:
+            self.clean_btn.set_label('清理选中')
+
+    # ------------------------------------------------------------ 明细
+
+    def _on_cat_selected(self, sel):
+        model, it = sel.get_selected()
+        if it is None:
+            return
+        key = model.get_value(it, C_KEY)
+        r = self.results.get(key)
+        if not r:
+            return
+        title = model.get_value(it, C_TITLE)
+        items = sorted(r['items'], key=lambda x: -x[1])
+        self.detail_store.clear()
+        try:
+            for p, s in items:
+                try:
+                    ts = time.strftime('%Y-%m-%d %H:%M',
+                                       time.localtime(os.lstat(p).st_mtime))
+                except OSError:
+                    ts = '—'
+                if p.startswith('journalctl --'):
+                    ts = '—'
+                self.detail_store.append([s, hsize(s), ts, p])
+            extra = ''
+            if r.get('err'):
+                extra = ' · <span foreground="#b26a00">%s</span>' % r['err']
+            if not items:
+                extra = ' · <span color="#888888">没有匹配项</span>'
+            self.detail_head.set_markup(
+                '<b>%s</b> · %d 项 · %s%s'
+                % (GLib.markup_escape_text(title), len(items),
+                   hsize(sum(s for _, s in items)), extra))
+            self.detail_store.set_sort_column_id(0, Gtk.SortType.DESCENDING)
+        except Exception as e:
+            self.detail_head.set_markup(
+                '<b>%s</b> · <span foreground="#c62828">读取明细失败:%s</span>'
+                % (GLib.markup_escape_text(title), GLib.markup_escape_text(str(e))))
+
+    def _on_detail_tooltip(self, widget, x, y, keyboard, tooltip):
+        pos = widget.get_path_at_pos(x, y)
+        if not pos:
+            return False
+        it = self.detail_store.get_iter(pos[0])
+        if it is None:
+            return False
+        size = self.detail_store.get_value(it, 0)
+        ts = self.detail_store.get_value(it, 2)
+        path = self.detail_store.get_value(it, 3)
+        hint = ''
+        if not path.startswith('journalctl --'):
+            hint = '\n<span size="small" color="#888888">双击可在文件管理器中定位</span>'
+        tooltip.set_markup('<b>%s</b>  %s\n%s%s'
+                           % (hsize(size), GLib.markup_escape_text(ts),
+                              GLib.markup_escape_text(path), hint))
+        return True
+
+    # ---- 明细操作:双击定位 / 右键菜单
+
+    def _on_detail_activate(self, tv, path, col):
+        it = self.detail_store.get_iter(path)
+        if it is None:
+            return
+        self.reveal(self.detail_store.get_value(it, 3))
+
+    def _on_detail_click(self, widget, event):
+        if event.button != 3:
+            return False
+        pos = widget.get_path_at_pos(int(event.x), int(event.y))
+        if not pos:
+            return False
+        it = self.detail_store.get_iter(pos[0])
+        if it is None:
+            return False
+        target = self.detail_store.get_value(it, 3)
+        widget.get_selection().select_iter(it)
+        menu = Gtk.Menu()
+        if not target.startswith('journalctl --'):
+            mi = Gtk.MenuItem(label='在文件管理器中显示')
+            mi.connect('activate', lambda *a: self.reveal(target))
+            menu.append(mi)
+        mi = Gtk.MenuItem(label='复制路径')
+        mi.connect('activate', lambda *a: self._copy(target))
+        menu.append(mi)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def _copy(self, text):
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clip.set_text(text, -1)
+        clip.store()
+        self.status.set_text('已复制路径')
+
+    def reveal(self, path):
+        """在文件管理器中打开所在目录并选中该项"""
+        if path.startswith('journalctl --'):
+            self._info('这一项是 systemd 日志,没有对应文件。\n'
+                       '清理时会按保留天数裁剪整个 journal 目录。')
+            return
+        if not os.path.exists(path):
+            self._info('路径已不存在(可能已被清理):\n%s' % path)
+            return
+        uri = Gio.File.new_for_path(path).get_uri()
+        # 1) 标准 D-Bus 接口:打开目录并选中
+        try:
+            rc = subprocess.call(
+                ['dbus-send', '--session',
+                 '--dest=org.freedesktop.FileManager1',
+                 '--type=method_call',
+                 '/org/freedesktop/FileManager1',
+                 'org.freedesktop.FileManager1.ShowItems',
+                 'array:string:' + uri, 'string:'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10)
+            if rc == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+        # 2) dde-file-manager 自带的 --show-item
+        try:
+            subprocess.Popen(['dde-file-manager', '--show-item', uri],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            pass
+        # 3) 兜底:只打开所在目录
+        target = path if os.path.isdir(path) else os.path.dirname(path)
+        try:
+            subprocess.Popen(['dde-file-manager', '--new-window', target],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self._info('打不开文件管理器。路径:\n%s' % path)
+
+    def _on_tooltip(self, widget, x, y, keyboard, tooltip):
+        res = widget.get_path_at_pos(x, y)
+        if not res:
+            return False
+        path = res[0]
+        it = self.cat_store.get_iter(path)
+        key = self.cat_store.get_value(it, C_KEY)
+        for c in CORE.CATALOG:
+            if c[0] == key:
+                extra = ''
+                r = self.results.get(key)
+                if r and r.get('err'):
+                    extra = '\n<span foreground="#b26a00">%s</span>' \
+                            % GLib.markup_escape_text(r['err'])
+                tooltip.set_markup('<b>%s</b>\n%s%s'
+                                   % (GLib.markup_escape_text(c[1]),
+                                      GLib.markup_escape_text(c[3]), extra))
+                return True
+        return False
+
+    # ------------------------------------------------------------ 清理
+
+    def _need_root(self, key):
+        for c in CORE.CATALOG:
+            if c[0] == key:
+                return c[5]
+        return False
+
+    def _cat_title(self, key):
+        for c in CORE.CATALOG:
+            if c[0] == key:
+                return c[1]
+        return key
+
+    def _on_clean(self, btn):
+        if self.cleaning or self.scanning:
+            return
+        keys = sorted(self.checked_keys(), key=lambda k: self.idx.get(k, 99))
+        if not keys:
+            return
+        rows = []
+        for k in keys:
+            r = self.results.get(k)
+            if not r or not r['items']:
+                continue
+            sz = sum(s for _, s in r['items'])
+            root = '(需密码) ' if self._need_root(k) else ''
+            rows.append('%9s  %s%s' % (hsize(sz), root, self._cat_title(k)))
+        if not rows:
+            self._info('没有可清理的内容。')
+            return
+        total = self.selected_size()
+        dlg = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text='确认清理 %d 类,共 %s?' % (len(rows), hsize(total)))
+        dlg.format_secondary_text('%s\n\n删除后不可恢复。' % '\n'.join(rows))
+        dlg.set_default_response(Gtk.ResponseType.CANCEL)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK:
+            return
+        self._execute(keys)
+
+    def _execute(self, keys):
+        self.cleaning = True
+        self.clean_btn.set_sensitive(False)
+        self.spinner.start()
+
+        sys_keys = [k for k in keys if self._need_root(k)]
+        user_keys = [k for k in keys if not self._need_root(k)]
+
+        if sys_keys:
+            self._spawn_terminal(sys_keys)
+
+        if not user_keys:
+            self.cleaning = False
+            self.spinner.stop()
+            self.update_summary()
+            self._info('系统类目已转交终端处理,输入密码后自动完成。')
+            return
+
+        items = []
+        for k in user_keys:
+            items.extend(self.results[k]['items'])
+        self.status.set_text('清理中…(%d 项)' % len(items))
+        threading.Thread(target=self._clean_worker, args=(items,),
+                         daemon=True).start()
+
+    def _clean_worker(self, items):
+        freed, ok, failed = CORE.delete_targets(items, use_sudo=False)
+        GLib.idle_add(self._clean_done, freed, ok, failed)
+
+    def _clean_done(self, freed, ok, failed):
+        self.cleaning = False
+        self.spinner.stop()
+        self.status.set_text('已清理 %d 项,回收 %s' % (ok, hsize(freed)))
+        msg = '删除 %d 项,回收 %s' % (ok, hsize(freed))
+        if failed:
+            msg += '\n\n%d 项失败(可能在运行中或权限不足):\n' % len(failed)
+            msg += '\n'.join(failed[:6])
+            if len(failed) > 6:
+                msg += '\n…'
+        self._info(msg)
+        self.rescan()
+        return False
+
+    def _spawn_terminal(self, sys_keys):
+        nums = ','.join(str(self.idx[k]) for k in sys_keys)
+        inner = ('sudo python3 %s -i %s -y -d %d; echo; '
+                 'printf "按回车关闭窗口..."; read _'
+                 % (_q(DISKC), nums, self.days))
+        try:
+            subprocess.Popen(['deepin-terminal', '--', 'bash', '-lc', inner])
+        except OSError:
+            self._info('未找到终端程序。请在终端手动执行:\n\n'
+                       'sudo diskc -i %s' % nums)
+
+    def _info(self, text, mtype=Gtk.MessageType.INFO):
+        dlg = Gtk.MessageDialog(transient_for=self, flags=0,
+                                message_type=mtype,
+                                buttons=Gtk.ButtonsType.OK)
+        dlg.set_markup('<b>提示</b>')
+        dlg.format_secondary_text(text)
+        dlg.run()
+        dlg.destroy()
+
+
+def _q(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def main():
+    app = Cleaner()
+    app.show_all()
+
+    if '--select' in sys.argv:
+        i = sys.argv.index('--select')
+        try:
+            n = int(sys.argv[i + 1])
+            GLib.timeout_add(1500, lambda: (app.select_row(n), False)[1])
+        except (IndexError, ValueError):
+            pass
+
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()
