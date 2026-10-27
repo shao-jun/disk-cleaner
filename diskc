@@ -18,6 +18,7 @@ from __future__ import print_function
 import argparse
 import concurrent.futures
 import glob
+import json
 import os
 import re
 import shutil
@@ -897,6 +898,8 @@ def main():
     ap.add_argument('--keys', default='', help='按类别 key 指定,如 journal,apt,rotated')
     ap.add_argument('-d', '--days', type=int, default=30, help='时间阈值(天),默认 30')
     ap.add_argument('-l', '--list', action='store_true', help='只列类别说明')
+    ap.add_argument('--files-from', default='',
+                    help='按清单精确删除:JSON 文件,内容为 [[路径,字节],...](GUI 用)')
     args = ap.parse_args()
 
     DAYS = args.days
@@ -905,6 +908,30 @@ def main():
         for i, c in enumerate(CATALOG, 1):
             print('%2d  %s%-8s\033[0m %-24s %s'
                   % (i, RISK_COLOR[c[2]], RISK_LABEL[c[2]], c[1], c[3]))
+        return 0
+
+    # GUI 转过来的精确清单:只删这些路径,不做全盘扫描
+    if args.files_from:
+        init_sudo()
+        try:
+            with open(args.files_from) as f:
+                data = json.load(f)
+        except Exception as e:
+            print('读取清单失败:%s' % e)
+            return 2
+        items = [(str(p), int(s)) for p, s in data]
+        if not items:
+            print('清单为空,没有要删除的文件。')
+            return 0
+        print('按清单清理 %d 项,共 %s'
+              % (len(items), hsize(sum(s for _, s in items))))
+        freed, ok, failed = delete_targets(items, use_sudo=is_root())
+        print('删除 %d 项,回收 %s' % (ok, hsize(freed)))
+        if failed:
+            print('%d 项失败:' % len(failed))
+            for p in failed[:20]:
+                print('  %s' % p)
+            return 1
         return 0
 
     init_sudo()

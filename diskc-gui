@@ -3,13 +3,15 @@
 """
 diskc-gui —— 磁盘垃圾清理(图形界面)
 
-扫描 → 左侧勾选类别 → 右侧查看明细 → 清理选中。
-系统级项目(日志/apt/coredump)需要管理员权限,会转交终端执行。
+扫描 → 左侧勾选整类 / 右侧逐条挑文件 → 只清理勾中的那些文件。
+系统级文件需要管理员权限,会把勾选的清单交给终端 sudo 精确删除。
 """
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -28,6 +30,10 @@ RISK_LABEL = {'safe': '安全', 'careful': '谨慎', 'risky': '高风险'}
 
 # ---- ListStore 列定义
 C_SEL, C_TITLE, C_RISK, C_RISKCOL, C_SIZE, C_COUNT, C_NOTE, C_KEY, C_ROOT = range(9)
+C_PART = 9      # 部分选中(三态显示的中间态)
+
+# ---- 明细 ListStore 列定义
+D_SIZE, D_SIZESTR, D_TS, D_PATH, D_CHK = range(5)
 
 
 def hsize(n):
@@ -60,6 +66,8 @@ class Cleaner(Gtk.Window):
         self.cleaning = False
         self.first_scan = True
         self.pending_select = None
+        self.sel = {}          # 类别 key -> 已勾选的具体文件路径集合
+        self.detail_key = ''   # 右侧当前显示的是哪个类别
         self.detail_query = ''
         self.detail_title = ''
         self.detail_total = 0
@@ -143,13 +151,13 @@ class Cleaner(Gtk.Window):
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         paned.add1(left)
 
-        self.cat_store = Gtk.ListStore(bool, str, str, str, str, str, str, str, bool)
+        self.cat_store = Gtk.ListStore(bool, str, str, str, str, str, str, str, bool, bool)
         tv = Gtk.TreeView(model=self.cat_store)
         tv.set_enable_search(False)
 
         r = Gtk.CellRendererToggle()
         r.connect('toggled', self._on_toggle)
-        c = Gtk.TreeViewColumn('', r, active=C_SEL)
+        c = Gtk.TreeViewColumn('', r, active=C_SEL, inconsistent=C_PART)
         c.set_fixed_width(34)
         tv.append_column(c)
 
@@ -210,7 +218,7 @@ class Cleaner(Gtk.Window):
         self.detail_head.set_xalign(0)
         self.detail_head.set_ellipsize(Pango.EllipsizeMode.END)
         self.detail_head.set_markup('<span size="small" color="#888888">'
-                                    '点击左侧类别查看文件 · 双击某一项可在文件管理器中定位</span>')
+                                    '勾选左侧整类,或在右侧逐条挑选 · 双击可在文件管理器中定位</span>')
         head.pack_start(self.detail_head, True, True, 0)
 
         self.detail_search = Gtk.SearchEntry()
@@ -227,8 +235,19 @@ class Cleaner(Gtk.Window):
         self.match_label.set_markup('<span size="small" color="#888888"></span>')
         head.pack_end(self.match_label, False, False, 0)
 
+        # 对"当前过滤结果"批量勾选 / 取消,方便先筛再挑
+        self.btn_none = Gtk.Button(label='取消结果')
+        self.btn_none.set_tooltip_text('把当前过滤出来的文件从清理列表里去掉')
+        self.btn_none.connect('clicked', self._on_check_visible, False)
+        head.pack_end(self.btn_none, False, False, 0)
+
+        self.btn_all = Gtk.Button(label='勾选结果')
+        self.btn_all.set_tooltip_text('把当前过滤出来的文件全部加入清理列表')
+        self.btn_all.connect('clicked', self._on_check_visible, True)
+        head.pack_end(self.btn_all, False, False, 0)
+
         # 第一列必须是 64 位:单个项目可超过 2G(< 2^31),用 int 会溢出导致明细整片空白
-        self.detail_store = Gtk.ListStore(GObject.TYPE_INT64, str, str, str)
+        self.detail_store = Gtk.ListStore(GObject.TYPE_INT64, str, str, str, bool)
         # 过滤层:只影响显示,不改动数据,也不改动左侧勾选
         self.detail_filter = self.detail_store.filter_new()
         self.detail_filter.set_visible_func(self._detail_visible)
@@ -238,6 +257,12 @@ class Cleaner(Gtk.Window):
         self.detail_model.set_sort_column_id(0, Gtk.SortType.DESCENDING)
         dtv = Gtk.TreeView(model=self.detail_model)
         dtv.set_enable_search(False)
+
+        r = Gtk.CellRendererToggle()
+        r.connect('toggled', self._on_detail_toggle)
+        c = Gtk.TreeViewColumn('', r, active=D_CHK)
+        c.set_fixed_width(30)
+        dtv.append_column(c)
 
         r = Gtk.CellRendererText()
         r.set_property('xalign', 1.0)
@@ -318,8 +343,9 @@ class Cleaner(Gtk.Window):
         self.scanning = True
         self.spinner.start()
         self.status.set_text('扫描中…')
-        checked = set(self.checked_keys())
-        threading.Thread(target=self._scan_worker, args=(self.days, checked),
+        # 把当前勾选快照传下去:重扫后仍存在的文件继续保持勾选
+        snapshot = dict((k, set(v)) for k, v in self.sel.items() if v)
+        threading.Thread(target=self._scan_worker, args=(self.days, snapshot),
                          daemon=True).start()
 
     def _scan_worker(self, days, checked):
@@ -333,6 +359,7 @@ class Cleaner(Gtk.Window):
         self.results = res
         self.cat_store.clear()
         self.idx = {}
+        self.sel = {}
         i = 0
         for cat in CORE.CATALOG:
             key = cat[0]
@@ -349,12 +376,16 @@ class Cleaner(Gtk.Window):
                 note = '需密码' if need_root else '出错'
             elif need_root:
                 note = '需密码'
-            sel = key in checked
+            paths = set(p for p, _ in r['items'])
+            keep = paths & checked.get(key, set())
             if self.first_scan and cat[6]:
-                sel = True
+                keep = paths
+            self.sel[key] = keep
+            on = bool(paths) and keep >= paths
+            part = bool(keep) and keep < paths
             self.cat_store.append([
-                sel, title, RISK_LABEL[risk], RISK_COLOR[risk],
-                hsize(size), str(len(r['items'])), note, key, need_root])
+                on, title, RISK_LABEL[risk], RISK_COLOR[risk],
+                hsize(size), str(len(r['items'])), note, key, need_root, part])
         self.first_scan = False
         self.spinner.stop()
         self.scanning = False
@@ -388,37 +419,93 @@ class Cleaner(Gtk.Window):
 
     # ------------------------------------------------------------ 选择
 
+    def _items_of(self, key):
+        r = self.results.get(key)
+        return r['items'] if r else []
+
+    def _cat_iter(self, key):
+        it = self.cat_store.get_iter_first()
+        while it is not None:
+            if self.cat_store.get_value(it, C_KEY) == key:
+                return it
+            it = self.cat_store.iter_next(it)
+        return None
+
     def _on_toggle(self, renderer, path):
+        """左侧勾选 = 整类全选 / 整类清空;部分选中时点一下变全选。"""
         it = self.cat_store.get_iter(path)
-        cur = self.cat_store.get_value(it, C_SEL)
-        self.cat_store.set_value(it, C_SEL, not cur)
+        key = self.cat_store.get_value(it, C_KEY)
+        paths = set(p for p, _ in self._items_of(key))
+        cur = self.sel.get(key, set())
+        if paths and cur >= paths:
+            self.sel[key] = set()
+        else:
+            self.sel[key] = paths
+        self._sync_cat(key)
+        self._sync_detail_checks(key)
         self.update_summary()
 
+    def _sync_cat(self, key):
+        """按已勾选的文件回写左侧勾选状态(全选 / 半选 / 空)。"""
+        it = self._cat_iter(key)
+        if it is None:
+            return
+        n = len(self._items_of(key))
+        c = len(self.sel.get(key, ()))
+        self.cat_store.set_value(it, C_SEL, n > 0 and c >= n)
+        self.cat_store.set_value(it, C_PART, 0 < c < n)
+
     def checked_keys(self):
-        return [row[C_KEY] for row in self.cat_store if row[C_SEL]]
+        return [row[C_KEY] for row in self.cat_store if row[C_SEL] or row[C_PART]]
 
     def select_by_risk(self, risks):
         risk_of = dict((c[0], c[2]) for c in CORE.CATALOG)
         for row in self.cat_store:
-            row[C_SEL] = risk_of.get(row[C_KEY]) in risks
+            key = row[C_KEY]
+            paths = set(p for p, _ in self._items_of(key))
+            want = risk_of.get(key) in risks and bool(paths)
+            row[C_SEL] = want
+            row[C_PART] = False
+            self.sel[key] = paths if want else set()
+        self._sync_detail_checks()
         self.update_summary()
 
+    def selected_items(self):
+        """只返回真正被勾选的文件 [(path, size), ...]。"""
+        out = []
+        for key, paths in self.sel.items():
+            if not paths:
+                continue
+            for p, s in self._items_of(key):
+                if p in paths:
+                    out.append((p, s))
+        return out
+
+    def selected_plan(self):
+        """key -> [(path, size)],按左侧显示顺序,只含被勾选的文件。"""
+        plan = {}
+        for row in self.cat_store:
+            key = row[C_KEY]
+            paths = self.sel.get(key)
+            if not paths:
+                continue
+            items = [(p, s) for p, s in self._items_of(key) if p in paths]
+            if items:
+                plan[key] = items
+        return plan
+
     def selected_size(self):
-        total = 0
-        for key in self.checked_keys():
-            r = self.results.get(key)
-            if r:
-                total += sum(s for _, s in r['items'])
-        return total
+        return sum(s for _, s in self.selected_items())
 
     def update_summary(self):
         keys = self.checked_keys()
+        nfiles = len(self.selected_items())
         size = self.selected_size()
-        self.sum_label.set_markup('已选 %d 类,合计 <b>%s</b>'
-                                  % (len(keys), hsize(size)))
-        self.clean_btn.set_sensitive(bool(keys) and not self.scanning
+        self.sum_label.set_markup('已选 %d 类 / %d 个文件,合计 <b>%s</b>'
+                                  % (len(keys), nfiles, hsize(size)))
+        self.clean_btn.set_sensitive(nfiles > 0 and not self.scanning
                                      and not self.cleaning)
-        if keys:
+        if nfiles:
             self.clean_btn.set_label('清理选中(%s)' % hsize(size))
         else:
             self.clean_btn.set_label('清理选中')
@@ -435,6 +522,8 @@ class Cleaner(Gtk.Window):
             return
         title = model.get_value(it, C_TITLE)
         items = sorted(r['items'], key=lambda x: -x[1])
+        self.detail_key = key
+        picked = self.sel.get(key, set())
         self.detail_store.clear()
         try:
             for p, s in items:
@@ -445,7 +534,7 @@ class Cleaner(Gtk.Window):
                     ts = '—'
                 if p.startswith('journalctl --'):
                     ts = '—'
-                self.detail_store.append([s, hsize(s), ts, p])
+                self.detail_store.append([s, hsize(s), ts, p, p in picked])
             self.detail_title = title
             self.detail_total = len(items)
             self.detail_size = sum(s for _, s in items)
@@ -514,6 +603,61 @@ class Cleaner(Gtk.Window):
             widget.set_text('')
             return True
         return False
+
+    # ---- 明细勾选:左侧整类 / 右侧逐条,两边实时联动
+
+    def _on_detail_toggle(self, renderer, path):
+        if not self.detail_key:
+            return
+        it = self.detail_model.get_iter(path)
+        if it is None:
+            return
+        p = self.detail_model.get_value(it, D_PATH)
+        s = self.sel.setdefault(self.detail_key, set())
+        if p in s:
+            s.discard(p)
+        else:
+            s.add(p)
+        self._sync_cat(self.detail_key)
+        self._sync_detail_checks(self.detail_key)
+        self.update_summary()
+
+    def _sync_detail_checks(self, key=None):
+        """把已勾选集合刷到右侧勾选列(只处理当前显示的类别)。"""
+        if not self.detail_key:
+            return
+        if key is not None and key != self.detail_key:
+            return
+        s = self.sel.get(self.detail_key, set())
+        it = self.detail_store.get_iter_first()
+        while it is not None:
+            p = self.detail_store.get_value(it, D_PATH)
+            want = p in s
+            if bool(self.detail_store.get_value(it, D_CHK)) != want:
+                self.detail_store.set_value(it, D_CHK, want)
+            it = self.detail_store.iter_next(it)
+
+    def _on_check_visible(self, btn, want):
+        """对当前过滤结果批量勾选 / 取消勾选。"""
+        if not self.detail_key:
+            return
+        s = self.sel.setdefault(self.detail_key, set())
+        n = 0
+        it = self.detail_store.get_iter_first()
+        while it is not None:
+            if self._detail_matches(self.detail_store, it):
+                p = self.detail_store.get_value(it, D_PATH)
+                if want:
+                    s.add(p)
+                else:
+                    s.discard(p)
+                n += 1
+            it = self.detail_store.iter_next(it)
+        self._sync_cat(self.detail_key)
+        self._sync_detail_checks(self.detail_key)
+        self.update_summary()
+        self.status.set_text('%s %d 个文件'
+                             % ('勾选' if want else '取消', n))
 
     def _on_win_key(self, widget, event):
         """Ctrl+F 聚焦明细过滤框。"""
@@ -656,56 +800,52 @@ class Cleaner(Gtk.Window):
     def _on_clean(self, btn):
         if self.cleaning or self.scanning:
             return
-        keys = sorted(self.checked_keys(), key=lambda k: self.idx.get(k, 99))
-        if not keys:
+        plan = self.selected_plan()
+        if not plan:
+            self._info('没有勾选任何文件。')
             return
+        nfiles = sum(len(v) for v in plan.values())
+        total = sum(s for v in plan.values() for _, s in v)
         rows = []
-        for k in keys:
-            r = self.results.get(k)
-            if not r or not r['items']:
-                continue
-            sz = sum(s for _, s in r['items'])
+        for k, items in plan.items():
             root = '(需密码) ' if self._need_root(k) else ''
-            rows.append('%9s  %s%s' % (hsize(sz), root, self._cat_title(k)))
-        if not rows:
-            self._info('没有可清理的内容。')
-            return
-        total = self.selected_size()
+            rows.append('%9s  %s%s  (%d 个文件)'
+                        % (hsize(sum(s for _, s in items)), root,
+                           self._cat_title(k), len(items)))
         dlg = Gtk.MessageDialog(
             transient_for=self, flags=0, message_type=Gtk.MessageType.WARNING,
             buttons=Gtk.ButtonsType.OK_CANCEL,
-            text='确认清理 %d 类,共 %s?' % (len(rows), hsize(total)))
-        dlg.format_secondary_text('%s\n\n删除后不可恢复。' % '\n'.join(rows))
+            text='确认清理 %d 个文件,共 %s?' % (nfiles, hsize(total)))
+        dlg.format_secondary_text('%s\n\n只删除上面列出的这些文件,删除后不可恢复。'
+                                  % '\n'.join(rows))
         dlg.set_default_response(Gtk.ResponseType.CANCEL)
         resp = dlg.run()
         dlg.destroy()
         if resp != Gtk.ResponseType.OK:
             return
-        self._execute(keys)
+        self._execute(plan)
 
-    def _execute(self, keys):
+    def _execute(self, plan):
         self.cleaning = True
         self.clean_btn.set_sensitive(False)
         self.spinner.start()
 
-        sys_keys = [k for k in keys if self._need_root(k)]
-        user_keys = [k for k in keys if not self._need_root(k)]
+        sys_plan = dict((k, v) for k, v in plan.items() if self._need_root(k))
+        user_items = [(p, s) for k, v in plan.items()
+                      if not self._need_root(k) for p, s in v]
 
-        if sys_keys:
-            self._spawn_terminal(sys_keys)
+        if sys_plan:
+            self._spawn_terminal(sys_plan)
 
-        if not user_keys:
+        if not user_items:
             self.cleaning = False
             self.spinner.stop()
             self.update_summary()
-            self._info('系统类目已转交终端处理,输入密码后自动完成。')
+            self._info('勾选的都是系统文件,已转交终端处理,输入密码后自动删除。')
             return
 
-        items = []
-        for k in user_keys:
-            items.extend(self.results[k]['items'])
-        self.status.set_text('清理中…(%d 项)' % len(items))
-        threading.Thread(target=self._clean_worker, args=(items,),
+        self.status.set_text('清理中…(%d 个文件)' % len(user_items))
+        threading.Thread(target=self._clean_worker, args=(user_items,),
                          daemon=True).start()
 
     def _clean_worker(self, items):
@@ -726,16 +866,25 @@ class Cleaner(Gtk.Window):
         self.rescan()
         return False
 
-    def _spawn_terminal(self, sys_keys):
-        nums = ','.join(str(self.idx[k]) for k in sys_keys)
-        inner = ('sudo python3 %s -i %s -y -d %d; echo; '
+    def _spawn_terminal(self, plan):
+        """把勾选的系统文件写成清单,交给终端里的 sudo 精确删除。"""
+        payload = [[p, s] for v in plan.values() for p, s in v]
+        try:
+            fd, path = tempfile.mkstemp(prefix='diskc-', suffix='.json')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(payload, f)
+            os.chmod(path, 0o600)
+        except Exception as e:
+            self._info('生成清理清单失败:%s' % e, Gtk.MessageType.ERROR)
+            return
+        inner = ('sudo python3 %s --files-from %s; rm -f %s; echo; '
                  'printf "按回车关闭窗口..."; read _'
-                 % (_q(DISKC), nums, self.days))
+                 % (_q(DISKC), _q(path), _q(path)))
         try:
             subprocess.Popen(['deepin-terminal', '--', 'bash', '-lc', inner])
         except OSError:
             self._info('未找到终端程序。请在终端手动执行:\n\n'
-                       'sudo diskc -i %s' % nums)
+                       'sudo python3 %s --files-from %s' % (DISKC, path))
 
     def _info(self, text, mtype=Gtk.MessageType.INFO):
         dlg = Gtk.MessageDialog(transient_for=self, flags=0,
