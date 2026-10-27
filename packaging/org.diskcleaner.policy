@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  disk-cleaner 的 polkit 动作定义。
+
+  作用:pkexec 调用 /usr/bin/python3 /usr/bin/diskc 时,匹配到本动作,
+  系统弹出的授权框就会显示下面的说明文字,而不是默认那句
+  “认证以运行 /usr/bin/python3”。
+
+  allow_active=auth_admin_keep:认证一次后短时间内保持授权,
+  连续清理系统日志时不会反复要密码。
+-->
+<policyconfig>
+  <vendor>Disk Cleaner</vendor>
+  <vendor_url>https://github.com/shao-jun/disk-cleaner</vendor_url>
+
+  <action id="org.diskcleaner.clean">
+    <description>Clean system junk files</description>
+    <description xml:lang="zh_CN">清理系统垃圾文件</description>
+    <message>Cleaning system logs and caches requires administrator rights</message>
+    <message xml:lang="zh_CN">清理系统日志与缓存需要管理员权限,请输入当前用户密码</message>
+    <icon_name>diskc</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/python3</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">/usr/bin/diskc</annotate>
+  </action>
+</policyconfig>

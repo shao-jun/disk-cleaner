@@ -43,6 +43,11 @@ for size in (24, 32, 48, 64, 128, 256):
         .savev(os.path.join(d, 'diskc.png'), 'png', [], [])
 PY
 
+# polkit 动作:让 pkexec 的授权框显示友好文案
+mkdir -p "$ROOT/usr/share/polkit-1/actions"
+install -m 644 packaging/org.diskcleaner.policy \
+    "$ROOT/usr/share/polkit-1/actions/org.diskcleaner.policy"
+
 # 文档
 install -m 644 README.md "$ROOT/usr/share/doc/$PKG/README.md"
 install -m 644 LICENSE "$ROOT/usr/share/doc/$PKG/copyright"

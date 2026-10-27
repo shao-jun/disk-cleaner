@@ -9,6 +9,7 @@ diskc-gui —— 磁盘垃圾清理(图形界面)
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,9 @@ from gi.repository import Gtk, GLib, Gdk, Gio, Pango, GObject  # noqa: E402
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 DISKC = os.path.join(HERE, 'diskc')
+# pkexec 会重置环境,解释器必须用绝对路径
+PKEXEC_PY = ('/usr/bin/python3' if os.path.exists('/usr/bin/python3')
+             else sys.executable)
 
 from importlib.machinery import SourceFileLoader  # noqa: E402
 CORE = SourceFileLoader('diskc_core', DISKC).load_module()
@@ -74,9 +78,22 @@ class Cleaner(Gtk.Window):
         self.detail_size = 0
         self.detail_err = ''
 
+        # 提权方式探测:优先用图形认证(pkexec),避免弹终端
+        self.can_pkexec = bool(shutil.which('pkexec'))
+        self.sudo_cached = self._sudo_cached()
+
         self._build_css()
         self._build_ui()
         self.rescan()
+
+    def _sudo_cached(self):
+        """sudo 是否处于免密窗口(刚输过密码的 15 分钟内)。"""
+        try:
+            return subprocess.call(['sudo', '-n', 'true'],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL) == 0
+        except OSError:
+            return False
 
     # ------------------------------------------------------------ 外观
 
@@ -373,9 +390,14 @@ class Cleaner(Gtk.Window):
             size = sum(s for _, s in r['items'])
             note = ''
             if r.get('err'):
-                note = '需密码' if need_root else '出错'
+                note = '需授权' if need_root else '出错'
             elif need_root:
-                note = '需密码'
+                if self.sudo_cached:
+                    note = ''                      # 已经在免密窗口,直接删
+                elif self.can_pkexec:
+                    note = '需授权'                # 清理时弹系统认证框
+                else:
+                    note = '需密码'
             paths = set(p for p, _ in r['items'])
             keep = paths & checked.get(key, set())
             if self.first_scan and cat[6]:
@@ -830,26 +852,50 @@ class Cleaner(Gtk.Window):
         self.clean_btn.set_sensitive(False)
         self.spinner.start()
 
+        # sudo 缓存是滚动的,每次清理重新探测一次
+        self.sudo_cached = self._sudo_cached()
+
         sys_plan = dict((k, v) for k, v in plan.items() if self._need_root(k))
-        user_items = [(p, s) for k, v in plan.items()
-                      if not self._need_root(k) for p, s in v]
+        plain = [(p, s) for k, v in plan.items()
+                 if not self._need_root(k) for p, s in v]
+        privileged = [(p, s) for v in sys_plan.values() for p, s in v]
 
-        if sys_plan:
-            self._spawn_terminal(sys_plan)
+        if privileged:
+            if self.sudo_cached:
+                pass                                # 与普通文件一起 sudo -n 删
+            elif self.can_pkexec:
+                self._pkexec_delete(sys_plan)       # 系统图形认证框,不开终端
+                privileged = []
+            else:
+                self._spawn_terminal(sys_plan)      # 兜底:终端里输密码
+                privileged = []
 
-        if not user_items:
+        if not plain and not privileged:
             self.cleaning = False
             self.spinner.stop()
             self.update_summary()
-            self._info('勾选的都是系统文件,已转交终端处理,输入密码后自动删除。')
+            if sys_plan and not self.sudo_cached:
+                self._info('系统文件需要管理员授权,在系统弹窗里确认后会自动删除。')
             return
 
-        self.status.set_text('清理中…(%d 个文件)' % len(user_items))
-        threading.Thread(target=self._clean_worker, args=(user_items,),
+        self.status.set_text('清理中…(%d 个文件)' % (len(plain) + len(privileged)))
+        threading.Thread(target=self._clean_worker, args=(plain, privileged),
                          daemon=True).start()
 
-    def _clean_worker(self, items):
-        freed, ok, failed = CORE.delete_targets(items, use_sudo=False)
+    def _clean_worker(self, plain, privileged):
+        freed = ok = 0
+        failed = []
+        if plain:
+            f, o, e = CORE.delete_targets(plain, use_sudo=False)
+            freed += f
+            ok += o
+            failed.extend(e)
+        if privileged:
+            CORE.SUDO = ['sudo', '-n']
+            f, o, e = CORE.delete_targets(privileged, use_sudo=True)
+            freed += f
+            ok += o
+            failed.extend(e)
         GLib.idle_add(self._clean_done, freed, ok, failed)
 
     def _clean_done(self, freed, ok, failed):
@@ -866,8 +912,59 @@ class Cleaner(Gtk.Window):
         self.rescan()
         return False
 
+    # ---- 系统文件:走 pkexec 图形认证,不开终端
+
+    def _pkexec_delete(self, plan):
+        payload = [[p, s] for v in plan.values() for p, s in v]
+        try:
+            fd, path = tempfile.mkstemp(prefix='diskc-', suffix='.json')
+            with os.fdopen(fd, 'w') as f:
+                json.dump(payload, f)
+            os.chmod(path, 0o600)
+        except Exception as e:
+            self.cleaning = False
+            self.spinner.stop()
+            self._info('生成清理清单失败:%s' % e, Gtk.MessageType.ERROR)
+            return
+        cmd = ['pkexec', PKEXEC_PY, DISKC, '--files-from', path]
+        threading.Thread(target=self._pkexec_worker, args=(cmd, path),
+                         daemon=True).start()
+
+    def _pkexec_worker(self, cmd, path):
+        rc, out = -1, ''
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+            out = p.communicate()[0].decode('utf-8', 'replace')
+            rc = p.returncode
+        except OSError as e:
+            out = str(e)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        GLib.idle_add(self._pkexec_done, rc, out)
+
+    def _pkexec_done(self, rc, out):
+        self.cleaning = False
+        self.spinner.stop()
+        if rc == 0:
+            self.status.set_text('系统文件已清理')
+            self._info('系统文件已删除。\n\n%s' % out.strip()[-300:])
+        elif rc in (126, 127):
+            self.update_summary()
+            self._info('没有授权,系统文件保持原样。\n\n'
+                       '这次只清理了普通文件。')
+        else:
+            self.update_summary()
+            self._info('系统文件清理未完成(退出码 %d):\n\n%s'
+                       % (rc, (out.strip() or '无输出')[-300:]),
+                       Gtk.MessageType.WARNING)
+        self.rescan()
+        return False
+
     def _spawn_terminal(self, plan):
-        """把勾选的系统文件写成清单,交给终端里的 sudo 精确删除。"""
+        """兜底:没有 pkexec 时把清单交给终端里的 sudo 精确删除。"""
         payload = [[p, s] for v in plan.values() for p, s in v]
         try:
             fd, path = tempfile.mkstemp(prefix='diskc-', suffix='.json')
