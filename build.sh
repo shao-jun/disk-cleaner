@@ -4,7 +4,7 @@
 set -e
 
 cd "$(dirname "$0")"
-VERSION="${1:-${VERSION:-1.2.1}}"
+VERSION="${1:-${VERSION:-1.2.2}}"
 PKG=disk-cleaner
 BUILD=build
 DIST=dist

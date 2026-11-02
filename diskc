@@ -203,24 +203,32 @@ def looks_like_log_dir(path):
 
 # ---------------------------------------------------------------- 各类扫描器
 
+JOURNAL_KEEP = 512 * 1024 ** 2       # journal 保留上限(按体积)
+
+
 def s_journal(days):
-    """systemd journal 持久化日志"""
+    """systemd journal 持久化日志:按体积裁剪,保留最近 512M
+
+    只按时间裁(--vacuum-time=Nd)对写日志猛的机器没用:一天就能写出几个 G,
+    实测 4.9G 日志全在当天,--vacuum-time=7d 的结果是 freed 0B。
+    """
     items = []
     rc, out = run(['journalctl', '--disk-usage'], use_sudo=True)
     total = 0
-    m = re.search(r'([\d.]+)([KMGTP]?)', out or '')
+    m = re.search(r'([\d.]+)\s*([KMGTP]?)', out or '')
     if m and 'take up' in out:
         mult = {'': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3,
                 'T': 1024 ** 4, 'P': 1024 ** 5}[m.group(2)]
         total = int(float(m.group(1)) * mult)
-    keep = min(days, 7) if days else 7
     if total == 0:
         # 无 root 时 journalctl 读不到总量,退化为统计目录
         jd = '/var/log/journal'
         if os.path.isdir(jd):
             total = path_size(jd)
-    if total > 32 * 1024 ** 2:
-        items.append(('journalctl --vacuum-time=%dd' % keep, total))
+    if total > JOURNAL_KEEP + 64 * 1024 ** 2:
+        # 可释放按"总量 - 保留上限"估算,而不是把总量全算成垃圾
+        items.append(('journalctl --vacuum-size=%dM' % (JOURNAL_KEEP // 1024 ** 2),
+                      total - JOURNAL_KEEP))
     return items
 
 
@@ -581,7 +589,7 @@ def s_wine_cache(days):
 
 # key, 标题, 风险, 描述, 扫描函数, 需 root, 默认勾选, 受天数影响
 CATALOG = [
-    ('journal', '系统 journald 日志', 'safe', 'systemd 日志,只保留最近 7 天',
+    ('journal', '系统 journald 日志', 'safe', 'systemd 日志,按体积只保留最近 500M',
      s_journal, True, True, False),
     ('apt', 'apt 安装包缓存', 'safe', '/var/cache/apt/archives 里的 deb,装完就没用了',
      s_apt, True, True, False),
@@ -712,6 +720,25 @@ def details(key, results, limit=40):
 
 # ---------------------------------------------------------------- 执行清理
 
+def run_journal_vacuum(spec, use_sudo=True):
+    """执行 journalctl --vacuum-* 规格,返回 (释放字节, 是否成功, 输出)。
+
+    journal 不能靠 rm 删:持久化日志是二进制 journal 文件,
+    必须交给 journalctl 自己按时间裁剪。
+    """
+    argv = spec.split()
+    if not argv or argv[0] != 'journalctl':
+        return 0, False, '无法识别的清理命令:%s' % spec
+    rc, out = run(argv, use_sudo=use_sudo, timeout=300)
+    freed = 0
+    m = re.search(r'freed\s+([\d.]+)\s*([KMGTP])', out or '')
+    if m:
+        mult = {'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3,
+                'T': 1024 ** 4, 'P': 1024 ** 5}[m.group(2)]
+        freed = int(float(m.group(1)) * mult)
+    return freed, rc == 0, out
+
+
 def delete_targets(items, use_sudo):
     """返回 (释放字节, 删除项数, 失败列表)"""
     freed = 0
@@ -721,6 +748,16 @@ def delete_targets(items, use_sudo):
     batch = []
     for path, size in items:
         if path.startswith('journalctl --'):
+            # 命令型条目(journal):交给 journalctl 按时间裁剪
+            f, okc, out = run_journal_vacuum(
+                path, use_sudo=bool(use_sudo) or is_root())
+            if okc:
+                freed += f
+                ok += 1
+            else:
+                tail = (out or '').strip().splitlines()
+                failed.append('%s (journalctl 失败%s)'
+                              % (path, (': ' + tail[-1]) if tail else ''))
             continue
         batch.append((path, size))
         if len(batch) >= 200:
@@ -804,17 +841,8 @@ def do_clean(keys, results, days, assume_yes=False):
             print('已取消,什么都没删。')
             return 1
 
-    # journal 用 vacuum
-    if 'journal' in keys:
-        keep = min(days, 7) if days else 7
-        print('\n  -> journalctl --vacuum-time=%dd ...' % keep)
-        rc, out = run(['journalctl', '--vacuum-time=%dd' % keep], use_sudo=True)
-        m = re.search(r'freed ([\d.]+)([KMG])', out)
-        if m:
-            mult = {'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3}[m.group(2)]
-            print('     释放 %s' % hsize(float(m.group(1)) * mult))
-
-    items = [(p, s) for p, s, k in plan if not p.startswith('journalctl --')]
+    # journal 条目由 delete_targets 内部调 journalctl 处理
+    items = [(p, s) for p, s, k in plan]
     sys_log = any(cat_by_key(k)[5] for k in keys)
     use_sudo = SUDO is not None and sys_log
     freed = 0

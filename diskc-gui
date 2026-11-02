@@ -29,7 +29,7 @@ PKEXEC_PY = ('/usr/bin/python3' if os.path.exists('/usr/bin/python3')
 from importlib.machinery import SourceFileLoader  # noqa: E402
 CORE = SourceFileLoader('diskc_core', DISKC).load_module()
 
-APP_VERSION = '1.2.1'
+APP_VERSION = '1.2.2'
 APP_AUTHOR = 'shao-jun'
 APP_EMAIL = 'shao-jun@users.noreply.github.com'
 APP_URL = 'https://github.com/shao-jun/disk-cleaner'

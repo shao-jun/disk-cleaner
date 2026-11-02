@@ -94,7 +94,7 @@ diskc --files-from a.json   # 按清单精确删除,GUI 提权清理走这条路
 
 | 类别 | 风险 | 说明 |
 |---|---|---|
-| 系统 journald 日志 | 安全 | 按保留天数裁剪 systemd 日志 |
+| 系统 journald 日志 | 安全 | 按体积裁剪,保留最近 500M(时间裁剪对日志暴增的机器无效) |
 | apt 安装包缓存 | 安全 | `/var/cache/apt/archives` |
 | 崩溃转储文件 | 安全 | `/var/crash`、coredump |
 | 系统临时文件 | 安全 | `/var/tmp` 中 7 天前的 |
